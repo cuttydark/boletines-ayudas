@@ -25,11 +25,21 @@ DEFAULT_HEADERS = {
     )
 }
 
-BOE_RSS = "https://www.boe.es/diario_boe/rss.php"
-DOE_RSS = "https://doe.juntaex.es/rss"  # Extremadura
-# BOJA: portada del último BOJA (más estable que /últimas)
-BOJA_LAST = "https://www.juntadeandalucia.es/eboja/boja-ultimo.do"
+# BOE: feed oficial (sumario del día)
+BOE_RSS = "https://www.boe.es/rss/boe.php"
 
+# BOJA: feeds oficiales (Atom). Puedes activar/desactivar en UI.
+BOJA_FEEDS_MAP = {
+    "Boletín completo": "https://www.juntadeandalucia.es/boja/distribucion/boja.xml",
+    "Disposiciones generales (S51)": "https://www.juntadeandalucia.es/boja/distribucion/s51.xml",
+    "Otras disposiciones (S63)": "https://www.juntadeandalucia.es/boja/distribucion/s63.xml",
+    "Otros anuncios (S69)": "https://www.juntadeandalucia.es/boja/distribucion/s69.xml",
+}
+
+# DOE Extremadura: RSS (mejor parsear BYTES por codificación)
+DOE_RSS = "https://doe.juntaex.es/rss/index.php"
+
+# Heurística para detectar ayudas/subvenciones
 KEY_FILTER = re.compile(
     r"\bayuda(s)?\b|\bsubvenci(ón|ones)\b|\bconvocatoria(s)?\b|\bbases reguladoras\b",
     re.I,
@@ -43,7 +53,6 @@ def parse_date(s: str):
         return dateparser.parse(s) if s else None
     except Exception:
         return None
-
 
 def normalize(src, boletin, title, summary, url, pub_date, raw=""):
     title = (title or "").strip()
@@ -59,7 +68,6 @@ def normalize(src, boletin, title, summary, url, pub_date, raw=""):
         "is_ayuda_subvencion": bool(KEY_FILTER.search(text)),
     }
 
-
 # ----------------------------
 # Fetchers robustos
 # ----------------------------
@@ -69,7 +77,7 @@ def fetch_boe():
     try:
         r = requests.get(BOE_RSS, headers=DEFAULT_HEADERS, timeout=20)
         r.raise_for_status()
-        feed = feedparser.parse(r.text)
+        feed = feedparser.parse(r.text)  # UTF-8
         for e in feed.entries:
             title = getattr(e, "title", "") or e.get("title", "")
             summary = BeautifulSoup(
@@ -87,6 +95,35 @@ def fetch_boe():
         st.warning(f"BOE RSS error: {ex}")
     return res
 
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_boja(selected_feed_urls):
+    out = []
+    for feed_url in selected_feed_urls:
+        try:
+            r = requests.get(feed_url, headers=DEFAULT_HEADERS, timeout=20)
+            r.raise_for_status()
+            feed = feedparser.parse(r.text)  # Atom
+            for e in feed.entries:
+                title = getattr(e, "title", "") or e.get("title", "")
+                summary_html = (
+                    getattr(e, "summary", "")
+                    or e.get("summary", "")
+                    or getattr(e, "subtitle", "")
+                    or e.get("subtitle", "")
+                )
+                summary = BeautifulSoup(summary_html, "html.parser").get_text(" ")
+                link = getattr(e, "link", "") or e.get("link", "")
+                pub = (
+                    getattr(e, "published", "")
+                    or getattr(e, "updated", "")
+                    or e.get("published")
+                    or e.get("updated")
+                )
+                out.append(normalize("rss", "BOJA", title, summary, link, pub))
+        except Exception as ex:
+            st.warning(f"BOJA feed error ({feed_url}): {ex}")
+            continue
+    return out
 
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_doe():
@@ -94,12 +131,12 @@ def fetch_doe():
     try:
         r = requests.get(DOE_RSS, headers=DEFAULT_HEADERS, timeout=20)
         r.raise_for_status()
-        feed = feedparser.parse(r.text)
+        # DOE: pasar BYTES para dejar a feedparser detectar la codificación
+        feed = feedparser.parse(r.content)
         for e in feed.entries:
             title = getattr(e, "title", "") or e.get("title", "")
-            summary = BeautifulSoup(
-                getattr(e, "summary", "") or e.get("summary", ""), "html.parser"
-            ).get_text(" ")
+            summary_html = getattr(e, "summary", "") or e.get("summary", "") or getattr(e, "description", "")
+            summary = BeautifulSoup(summary_html, "html.parser").get_text(" ")
             link = getattr(e, "link", "") or e.get("link", "")
             pub = (
                 getattr(e, "published", "")
@@ -112,59 +149,16 @@ def fetch_doe():
         st.warning(f"DOE RSS error: {ex}")
     return res
 
-
-@st.cache_data(ttl=600, show_spinner=False)
-def fetch_boja():
-    out = []
-    try:
-        # Usa la portada del último BOJA y sigue enlaces útiles (sumario/disposiciones)
-        r = requests.get(BOJA_LAST, headers=DEFAULT_HEADERS, timeout=20)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
-
-        for a in soup.select("a[href]"):
-            href = a["href"]
-            if not href:
-                continue
-            if "eboja" in href and any(k in href for k in ("sumario", "disposiciones", ".html")):
-                url = urljoin(BOJA_LAST, href)
-                try:
-                    p = requests.get(url, headers=DEFAULT_HEADERS, timeout=15)
-                    p.raise_for_status()
-                    t = BeautifulSoup(p.text, "html.parser")
-                    h = t.find(["h1", "h2"])
-                    title = h.get_text(" ").strip() if h else "BOJA"
-                    summary = t.get_text(" ")[:1200]
-                    meta = t.find("meta", {"name": "date"}) or t.find(
-                        "meta", {"property": "article:published_time"}
-                    )
-                    pub = meta.get("content") if meta and meta.get("content") else None
-                    out.append(normalize("scrape", "BOJA", title, summary, url, pub))
-                except Exception:
-                    continue
-    except Exception as ex:
-        st.warning(f"BOJA error: {ex}")
-    return out
-
-
 # ----------------------------
 # Pipeline + diagnóstico
 # ----------------------------
-def run_pipeline(keywords, desde, hasta, limite, use_or=False, debug=False):
+def run_pipeline(keywords, desde, hasta, limite, use_or=False, selected_boja_urls=None, debug=False):
     raw_boe = fetch_boe()
-    raw_boja = fetch_boja()
+    raw_boja = fetch_boja(selected_boja_urls or [])
     raw_doe = fetch_doe()
 
     data = raw_boe + raw_boja + raw_doe
-    base_cols = [
-        "boletin",
-        "source",
-        "title",
-        "summary",
-        "url",
-        "pub_date",
-        "is_ayuda_subvencion",
-    ]
+    base_cols = ["boletin","source","title","summary","url","pub_date","is_ayuda_subvencion"]
     df = pd.DataFrame(data)
     counts = {"BOE": len(raw_boe), "BOJA": len(raw_boja), "DOE": len(raw_doe)}
 
@@ -188,7 +182,7 @@ def run_pipeline(keywords, desde, hasta, limite, use_or=False, debug=False):
     # Keywords
     if keywords:
         title = df["title"].fillna("")
-        summ = df["summary"].fillna("")
+        summ  = df["summary"].fillna("")
         if use_or:
             # OR: al menos una keyword coincide
             mask_total = False
@@ -199,9 +193,7 @@ def run_pipeline(keywords, desde, hasta, limite, use_or=False, debug=False):
         else:
             # AND: deben coincidir todas
             for kw in keywords:
-                df = df[
-                    title.str.contains(kw, case=False) | summ.str.contains(kw, case=False)
-                ]
+                df = df[ title.str.contains(kw, case=False) | summ.str.contains(kw, case=False) ]
 
     # Fechas
     if desde is not None:
@@ -209,8 +201,8 @@ def run_pipeline(keywords, desde, hasta, limite, use_or=False, debug=False):
     if hasta is not None:
         df = df[df["pub_date"].fillna(pd.Timestamp.max) <= hasta]
 
+    # Orden y límite
     df = df.sort_values("pub_date", ascending=False, na_position="last")
-
     if limite:
         df = df.head(int(limite))
 
@@ -224,7 +216,6 @@ def run_pipeline(keywords, desde, hasta, limite, use_or=False, debug=False):
 
     return df.reset_index(drop=True), counts, debug_samples
 
-
 # ----------------------------
 # UI
 # ----------------------------
@@ -235,9 +226,15 @@ with st.sidebar:
     c1, c2 = st.columns(2)
     desde = c1.date_input("Desde", None)
     hasta = c2.date_input("Hasta", None)
+
     kw = st.text_input("Palabras clave (;). Vacío = sin filtro", "")
     use_or = st.toggle("Usar OR entre palabras", value=True)
     lim = st.number_input("Límite", 0, 2000, 200, 50)
+
+    st.header("BOJA · Secciones")
+    boja_opts = list(BOJA_FEEDS_MAP.keys())
+    sel_sections = st.multiselect("Selecciona secciones BOJA", boja_opts, default=["Boletín completo", "Otras disposiciones (S63)"])
+    selected_boja_urls = [BOJA_FEEDS_MAP[k] for k in sel_sections]
 
     st.header("Debug")
     debug = st.toggle("Mostrar diagnóstico (muestras crudas)", value=False)
@@ -252,6 +249,7 @@ if run:
         datetime.combine(hasta, datetime.max.time()) if hasta else None,
         lim,
         use_or=use_or,
+        selected_boja_urls=selected_boja_urls,
         debug=debug,
     )
 
@@ -261,8 +259,8 @@ if run:
 
     if df.empty:
         st.warning(
-            "Sin resultados. Prueba a dejar las palabras clave vacías y OR activado, "
-            "o amplía el rango de fechas."
+            "Sin resultados. Deja palabras clave vacías y OR activado para validar fuentes, "
+            "o amplía fechas/activa más secciones BOJA."
         )
     else:
         st.success(f"{len(df)} resultados")
