@@ -5,7 +5,3 @@ feedparser
 python-dateutil
 pandas
 openpyxl
-gspread
-google-auth
-gspread-dataframe
-lxml
