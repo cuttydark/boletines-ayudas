@@ -16,19 +16,21 @@ DEFAULT_HEADERS = {
 # BOE (RSS oficial del sumario del día)
 BOE_RSS = "https://www.boe.es/rss/boe.php"
 
-# BOJA (algunos feeds pueden no estar disponibles; se ignoran con warn)
+# BOJA (algunas secciones pueden devolver 404 => se ignoran con warning)
 BOJA_FEEDS_MAP = {
     "Boletín completo": "https://www.juntadeandalucia.es/boja/distribucion/boja.xml",
     "Disposiciones generales (S51)": "https://www.juntadeandalucia.es/boja/distribucion/s51.xml",
+    # Estas dos suelen cambiar o dar 404; déjalas desmarcadas salvo prueba puntual:
     "Otras disposiciones (S63)": "https://www.juntadeandalucia.es/boja/distribucion/s63.xml",
     "Otros anuncios (S69)": "https://www.juntadeandalucia.es/boja/distribucion/s69.xml",
 }
 
-# DOE Extremadura
+# DOE Extremadura (RSS index; usar bytes por codificación)
 DOE_RSS = "https://doe.juntaex.es/rss/index.php"
 
 KEY_FILTER = re.compile(
-    r"\bayuda(s)?\b|\bsubvenci(ón|ones)\b|\bconvocatoria(s)?\b|\bbases reguladoras\b", re.I
+    r"\bayuda(s)?\b|\bsubvenci(ón|ones)\b|\bconvocatoria(s)?\b|\bbases reguladoras\b",
+    re.I,
 )
 
 # ---------- Utils ----------
@@ -77,7 +79,7 @@ def fetch_boja(selected_feed_urls):
         try:
             r = requests.get(feed_url, headers=DEFAULT_HEADERS, timeout=20)
             r.raise_for_status()
-            feed = feedparser.parse(r.text)
+            feed = feedparser.parse(r.text)  # Atom
             for e in feed.entries:
                 title = getattr(e, "title", "") or e.get("title", "")
                 summary_html = getattr(e, "summary", "") or e.get("summary", "") or getattr(e, "subtitle", "") or e.get("subtitle", "")
@@ -96,8 +98,7 @@ def fetch_doe():
     try:
         r = requests.get(DOE_RSS, headers=DEFAULT_HEADERS, timeout=20)
         r.raise_for_status()
-        # BYTES para que feedparser detecte codificación
-        feed = feedparser.parse(r.content)
+        feed = feedparser.parse(r.content)  # bytes -> autodetect charset
         for e in feed.entries:
             title = getattr(e, "title", "") or e.get("title", "")
             summary_html = getattr(e, "summary", "") or e.get("summary", "") or getattr(e, "description", "")
@@ -110,7 +111,7 @@ def fetch_doe():
     return res
 
 # ---------- Pipeline ----------
-def run_pipeline(keywords, desde, hasta, limite, use_or=False, selected_boja_urls=None, debug=False):
+def run_pipeline(keywords, desde, hasta, limite, use_or=False, include_all=False, selected_boja_urls=None, debug=False):
     raw_boe  = fetch_boe()
     raw_boja = fetch_boja(selected_boja_urls or [])
     raw_doe  = fetch_doe()
@@ -127,18 +128,17 @@ def run_pipeline(keywords, desde, hasta, limite, use_or=False, selected_boja_url
             "DOE": pd.DataFrame(raw_doe)[:5],
         }
 
-    # Columnas + fechas a naive (sin tz) para evitar TypeError
+    # Columnas + fechas a naive (sin tz)
     for c in base_cols:
         if c not in df.columns:
             df[c] = None
+
     df["is_ayuda_subvencion"] = df["is_ayuda_subvencion"].fillna(False)
+    df["pub_date"] = pd.to_datetime(df["pub_date"], errors="coerce", utc=True).dt.tz_localize(None)
 
-    # -> convierte a datetime (UTC) y luego quita tz (naive)
-    df["pub_date"] = pd.to_datetime(df["pub_date"], errors="coerce", utc=True)
-    df["pub_date"] = df["pub_date"].dt.tz_localize(None)
-
-    # Filtro base
-    df = df[df["is_ayuda_subvencion"] == True]
+    # Filtro base (puede desactivarse con include_all)
+    if not include_all:
+        df = df[df["is_ayuda_subvencion"] == True]
 
     # Keywords
     if keywords:
@@ -154,7 +154,7 @@ def run_pipeline(keywords, desde, hasta, limite, use_or=False, selected_boja_url
             for kw in keywords:
                 df = df[ title.str.contains(kw, case=False) | summ.str.contains(kw, case=False) ]
 
-    # Fechas (naive)
+    # Fechas
     if desde is not None:
         df = df[df["pub_date"].fillna(pd.Timestamp.min) >= desde]
     if hasta is not None:
@@ -185,11 +185,12 @@ with st.sidebar:
 
     kw = st.text_input("Palabras clave (;). Vacío = sin filtro", "")
     use_or = st.toggle("Usar OR entre palabras", value=True)
+    include_all = st.toggle("Incluir TODO (ignorar filtro de ayudas/subvenciones)", value=False)
     lim = st.number_input("Límite", 0, 2000, 200, 50)
 
     st.header("BOJA · Secciones")
     boja_opts = list(BOJA_FEEDS_MAP.keys())
-    # Por defecto NO marcamos S63 para evitar el 404 que estás viendo.
+    # Por defecto, evitamos S63 y S69 (404 en tu despliegue)
     sel_sections = st.multiselect(
         "Selecciona secciones BOJA",
         boja_opts,
@@ -203,7 +204,7 @@ with st.sidebar:
     run = st.button("Buscar", type="primary")
 
 if run:
-    # Convierte date → datetime naive
+    # date -> datetime naive
     desde = datetime.combine(desde_d, time.min) if desde_d else None
     hasta = datetime.combine(hasta_d, time.max) if hasta_d else None
 
@@ -211,6 +212,7 @@ if run:
     df, counts, debug_samples = run_pipeline(
         kws, desde, hasta, lim,
         use_or=use_or,
+        include_all=include_all,
         selected_boja_urls=selected_boja_urls,
         debug=debug,
     )
@@ -218,7 +220,7 @@ if run:
     st.caption(f"Entradas brutas → BOE: {counts['BOE']} | BOJA: {counts['BOJA']} | DOE: {counts['DOE']}")
 
     if df.empty:
-        st.warning("Sin resultados. Deja palabras clave vacías y OR activado para validar fuentes, o activa más secciones BOJA.")
+        st.warning("Sin resultados. Activa 'Incluir TODO' y deja keywords vacías para validar fuentes. Si BOJA da 404 en S63/S69, deja sólo 'boja.xml' y 'S51'.")
     else:
         st.success(f"{len(df)} resultados")
         st.dataframe(df, use_container_width=True, height=650)
