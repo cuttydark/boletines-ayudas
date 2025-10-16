@@ -1,4 +1,4 @@
-# app.py — BOJA + BOE con filtro "ayuda/subvención" + keywords
+# app.py — BOJA + BOE con reintentos y búsqueda histórica
 import re
 from datetime import datetime, date, time, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -9,52 +9,90 @@ import feedparser
 import streamlit as st
 from bs4 import BeautifulSoup
 from dateutil import parser as dateparser
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 st.set_page_config(page_title="Ayudas/Subvenciones · BOJA + BOE", layout="wide")
 
 # ----------------------------
-# Constantes y headers
+# HTTP session con reintentos
 # ----------------------------
-DEFAULT_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+def build_session():
+    s = requests.Session()
+    retry = Retry(
+        total=5, connect=5, read=5, status=5,
+        backoff_factor=0.8,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET", "HEAD"]
     )
-}
+    s.mount("https://", HTTPAdapter(max_retries=retry))
+    s.mount("http://",  HTTPAdapter(max_retries=retry))
+    s.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+        )
+    })
+    return s
 
-# BOJA — feeds oficiales (Atom). Algunas secciones fluctúan (404).
+SESSION = build_session()
+
+def http_get(url, timeout=(10, 30)):
+    r = SESSION.get(url, timeout=timeout)
+    r.raise_for_status()
+    return r
+
+# ----------------------------
+# Constantes
+# ----------------------------
+# BOJA — variantes por sección (para sortear timeouts/404 puntuales)
 BOJA_FEEDS_MAP = {
-    "Boletín completo": "https://www.juntadeandalucia.es/boja/distribucion/boja.xml",
-    "Disposiciones generales (S51)": "https://www.juntadeandalucia.es/boja/distribucion/s51.xml",
-    # Úsalas solo si funcionan en tu despliegue:
-    "Otras disposiciones (S63)": "https://www.juntadeandalucia.es/boja/distribucion/s63.xml",
-    "Otros anuncios (S69)": "https://www.juntadeandalucia.es/boja/distribucion/s69.xml",
+    "Boletín completo": [
+        "https://www.juntadeandalucia.es/boja/distribucion/boja.xml",
+        "https://juntadeandalucia.es/boja/distribucion/boja.xml",
+        "http://www.juntadeandalucia.es/boja/distribucion/boja.xml",
+    ],
+    "Disposiciones generales (S51)": [
+        "https://www.juntadeandalucia.es/boja/distribucion/s51.xml",
+        "https://juntadeandalucia.es/boja/distribucion/s51.xml",
+        "http://www.juntadeandalucia.es/boja/distribucion/s51.xml",
+    ],
+    # Activar solo si funcionan en tu despliegue (suelen fluctuar):
+    "Otras disposiciones (S63)": [
+        "https://www.juntadeandalucia.es/boja/distribucion/s63.xml",
+        "https://juntadeandalucia.es/boja/distribucion/s63.xml",
+        "http://www.juntadeandalucia.es/boja/distribucion/s63.xml",
+    ],
+    "Otros anuncios (S69)": [
+        "https://www.juntadeandalucia.es/boja/distribucion/s69.xml",
+        "https://juntadeandalucia.es/boja/distribucion/s69.xml",
+        "http://www.juntadeandalucia.es/boja/distribucion/s69.xml",
+    ],
 }
 
-# BOJA — histórico por número de boletín
+def selected_boja_urls_from_keys(keys):
+    # Devuelve las URLs canónicas (primer elemento de cada variante)
+    return [BOJA_FEEDS_MAP[k][0] for k in keys]
+
 def boja_index_url(year: int, num: int) -> str:
     return f"https://www.juntadeandalucia.es/boja/{year}/{str(num).zfill(3)}/index.html"
 
-# BOE — RSS diario (sumario del día)
+# BOE
 BOE_RSS = "https://www.boe.es/rss/boe.php"
-
-# BOE — sumario por fecha (YYYY/MM/DD)
 def boe_sumario_url(dt: date) -> str:
     return f"https://www.boe.es/boe/dias/{dt.year:04d}/{dt.month:02d}/{dt.day:02d}/"
 
 # ----------------------------
-# Heurísticas de detección
+# Heurísticas y utilidades
 # ----------------------------
-AYUDA_RE = re.compile(r"\bayuda(s)?\b|\bsubvenci(ón|ones)\b", re.I)
-BASE_KEY_RE = re.compile(r"\bayuda(s)?\b|\bsubvenci(ón|ones)\b|\bconvocatoria(s)?\b|\bbases reguladoras\b", re.I)
-
+BASE_KEY_RE = re.compile(
+    r"\bayuda(s)?\b|\bsubvenci(ón|ones)\b|\bconvocatoria(s)?\b|\bbases reguladoras\b", re.I
+)
 ENTIDAD_RE = re.compile(
     r"\bayuntamiento(s)?\b|\bmunicipio(s)?\b|\bentidad(es)? (local(es)?|pública(s)?)\b|"
     r"\bmancomunidad(es)?\b|\bdiputaci(ón|ones)\b|\buniversidad(es)?\b|\basociaci(ón|ones)\b|"
     r"\bfundaci(ón|ones)\b|\bconsorcio(s)?\b|\bcámara(s)? de comercio\b", re.I
 )
-
-# Órgano/consejería u organismo (BOJA/BOE)
 ORGANO_RE = re.compile(
     r"(Consejer[íi]a de [A-ZÁÉÍÓÚÑ][\w\sÁÉÍÓÚÑ\-]+|"
     r"Viceconsejer[íi]a de [A-ZÁÉÍÓÚÑ][\w\sÁÉÍÓÚÑ\-]+|"
@@ -64,15 +102,13 @@ ORGANO_RE = re.compile(
     r"Jefatura del Estado|Secretar[íi]a de Estado [\w\sÁÉÍÓÚÑ\-]+)",
     re.I
 )
-
 SPANISH_MONTHS = {
     "enero":1, "febrero":2, "marzo":3, "abril":4, "mayo":5, "junio":6,
     "julio":7, "agosto":8, "septiembre":9, "setiembre":9, "octubre":10, "noviembre":11, "diciembre":12
 }
+SECTION_HREF_PAT = re.compile(r"/boja/\d{4}/\d{3}/(s?\d+\.html|\d+)$")
+DOC_ID_PAT = re.compile(r"txt\.php\?id=BOE-[A-Z]-\d{4}-\d+")
 
-# ----------------------------
-# Utilidades
-# ----------------------------
 def parse_spanish_date(text: str):
     if not text:
         return None
@@ -124,44 +160,63 @@ def to_naive_dt(x):
     return dt.tz_localize(None)
 
 # ----------------------------
-# BOJA — FEEDS
+# BOJA — feeds con variantes + reintentos
 # ----------------------------
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_boja_feeds(selected_feed_urls):
+    # Mapa alias → conjunto de variantes
+    url_aliases = {}
+    for variants in BOJA_FEEDS_MAP.values():
+        for v in variants:
+            url_aliases[v] = variants
+
     out = []
-    for feed_url in selected_feed_urls:
-        try:
-            r = requests.get(feed_url, headers=DEFAULT_HEADERS, timeout=20)
-            r.raise_for_status()
-            feed = feedparser.parse(r.text)  # Atom
-            for e in feed.entries:
-                title = getattr(e, "title", "") or e.get("title", "")
-                summary_html = getattr(e, "summary", "") or e.get("summary", "") or getattr(e, "subtitle", "") or e.get("subtitle", "")
-                summary = BeautifulSoup(summary_html, "html.parser").get_text(" ")
-                link = getattr(e, "link", "") or e.get("link", "")
-                pub_raw = getattr(e, "published", "") or getattr(e, "updated", "") or e.get("published") or e.get("updated")
-                pub = parse_date_safe(pub_raw)
-                out.append(normalize_record("BOJA", "feed", title, summary, link, pub))
-        except Exception as ex:
-            st.warning(f"BOJA feed error ({feed_url}): {ex}")
-            continue
+    for canonical in selected_feed_urls:
+        variants = url_aliases.get(canonical, [canonical])
+        last_err, ok = None, False
+        for u in variants:
+            try:
+                r = http_get(u, timeout=(10, 30))
+                feed = feedparser.parse(r.content)  # bytes: mejor encoding
+                for e in feed.entries:
+                    title = getattr(e, "title", "") or e.get("title", "")
+                    summary_html = (
+                        getattr(e, "summary", "") or e.get("summary", "") or
+                        getattr(e, "subtitle", "") or e.get("subtitle", "")
+                    )
+                    summary = BeautifulSoup(summary_html, "html.parser").get_text(" ")
+                    link = getattr(e, "link", "") or e.get("link", "")
+                    pub_raw = (
+                        getattr(e, "published", "") or getattr(e, "updated", "") or
+                        e.get("published") or e.get("updated")
+                    )
+                    pub = parse_date_safe(pub_raw)
+                    out.append(normalize_record("BOJA", "feed", title, summary, link, pub))
+                ok = True
+                break
+            except Exception as ex:
+                last_err = ex
+                continue
+        if not ok:
+            st.warning(f"BOJA feed error ({canonical}): {last_err}")
     return out
 
 # ----------------------------
-# BOJA — HISTÓRICO por {año}/{número}
+# BOJA — histórico {año}/{número}
 # ----------------------------
-SECTION_HREF_PAT = re.compile(r"/boja/\d{4}/\d{3}/(s?\d+\.html|\d+)$")
-
 def parse_boja_section(html: str, url: str, pub_dt):
     soup = BeautifulSoup(html, "html.parser")
     records = []
     for item in soup.select("article, .disposicion, .resultado, .result, .detalle, .noticia, .listado li"):
         h = item.find(["h2","h3","a"])
-        title = (h.get_text(" ").strip() if h else (soup.title.get_text(" ").strip() if soup.title else "BOJA"))
+        title = h.get_text(" ").strip() if h else (soup.title.get_text(" ").strip() if soup.title else "BOJA")
         a = item.find("a", href=True)
         href = a["href"] if a else url
         if href.startswith("/"):
             href = f"https://www.juntadeandalucia.es{href}"
+        elif not href.startswith("http"):
+            base = url.rsplit("/", 1)[0] + "/"
+            href = base + href
         summary = item.get_text(" ").strip()
         records.append(normalize_record("BOJA", "hist", title, summary, href, pub_dt, raw=item.decode()))
     if not records:
@@ -196,13 +251,12 @@ def parse_boja_index(html: str, url: str):
 
     results = []
     with ThreadPoolExecutor(max_workers=8) as ex:
-        futs = {ex.submit(requests.get, u, headers=DEFAULT_HEADERS, timeout=15): u for u in section_links}
-        for fut in as_completed(futs):
-            u = futs[fut]
+        futures = {ex.submit(http_get, u, (10, 30)): u for u in section_links}
+        for fut in as_completed(futures):
+            u = futures[fut]
             try:
                 r = fut.result()
-                if r.status_code == 200:
-                    results.extend(parse_boja_section(r.text, u, pub_dt))
+                results.extend(parse_boja_section(r.text, u, pub_dt))
             except Exception:
                 continue
     return results
@@ -210,9 +264,7 @@ def parse_boja_index(html: str, url: str):
 def fetch_one_boja_number(year: int, num: int):
     url = boja_index_url(year, num)
     try:
-        r = requests.get(url, headers=DEFAULT_HEADERS, timeout=15)
-        if r.status_code != 200:
-            return []
+        r = http_get(url, timeout=(10, 30))
         return parse_boja_index(r.text, url)
     except Exception:
         return []
@@ -232,15 +284,14 @@ def fetch_boja_range(year: int, start_num: int, end_num: int, max_workers: int =
     return results
 
 # ----------------------------
-# BOE — RSS (día actual)
+# BOE — RSS y por fechas
 # ----------------------------
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_boe_rss():
     out = []
     try:
-        r = requests.get(BOE_RSS, headers=DEFAULT_HEADERS, timeout=20)
-        r.raise_for_status()
-        feed = feedparser.parse(r.text)
+        r = http_get(BOE_RSS, timeout=(10, 30))
+        feed = feedparser.parse(r.content)
         for e in feed.entries:
             title = getattr(e, "title", "") or e.get("title", "")
             summary_html = getattr(e, "summary", "") or e.get("summary", "")
@@ -252,13 +303,16 @@ def fetch_boe_rss():
         st.warning(f"BOE RSS error: {ex}")
     return out
 
-# ----------------------------
-# BOE — por fechas (sumarios diarios)
-# ----------------------------
-DOC_ID_PAT = re.compile(r"txt\.php\?id=BOE-[A-Z]-\d{4}-\d+")
+def daterange(d0: date, d1: date):
+    step = 1 if d0 <= d1 else -1
+    cur = d0
+    while True:
+        yield cur
+        if cur == d1: break
+        cur = cur + timedelta(days=step)
+
 def parse_boe_sumario(html: str, url: str):
     soup = BeautifulSoup(html, "html.parser")
-    # fecha del sumario
     text_for_date = " ".join([
         soup.get_text(" "),
         " ".join([m.get("content","") for m in soup.select("meta[name=date], meta[property='article:published_time']")])
@@ -271,34 +325,23 @@ def parse_boe_sumario(html: str, url: str):
             if href.startswith("/"):
                 href = f"https://www.boe.es{href}"
             title = a.get_text(" ").strip()
-            # contexto cercano como resumen
             parent_text = a.find_parent().get_text(" ").strip() if a.find_parent() else title
             recs.append(normalize_record("BOE", "day", title, parent_text, href, pub_dt))
-    # fallback: si vacío, mete el sumario como registro
     if not recs:
         recs.append(normalize_record("BOE", "day", soup.title.get_text(" ").strip() if soup.title else "BOE", soup.get_text(" "), url, pub_dt))
     return recs
-
-def daterange(d0: date, d1: date):
-    step = 1 if d0 <= d1 else -1
-    cur = d0
-    while True:
-        yield cur
-        if cur == d1: break
-        cur = cur + timedelta(days=step)
 
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_boe_by_dates(start_d: date, end_d: date, max_workers: int = 6):
     results = []
     dates = list(daterange(start_d, end_d))
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = {ex.submit(requests.get, boe_sumario_url(d), headers=DEFAULT_HEADERS, timeout=15): d for d in dates}
+        futures = {ex.submit(http_get, boe_sumario_url(d), (10, 30)): d for d in dates}
         for fut in as_completed(futures):
             d = futures[fut]
             try:
                 r = fut.result()
-                if r.status_code == 200:
-                    results.extend(parse_boe_sumario(r.text, boe_sumario_url(d)))
+                results.extend(parse_boe_sumario(r.text, boe_sumario_url(d)))
             except Exception:
                 continue
     return results
@@ -314,14 +357,10 @@ def filter_and_format(df: pd.DataFrame, keywords, use_or: bool, include_all: boo
     for c in base_cols:
         if c not in df.columns: df[c] = None
 
-    # fechas → naive
-    df["pub_date"] = df["pub_date"].apply(to_naive_dt)
-
-    # filtro base: “ayuda/subvención/convocatoria/bases reguladoras”
+    df["pub_date"] = df["pub_date"].apply(lambda x: to_naive_dt(x))
     if not include_all:
         df = df[df["is_ayuda_subvencion"] == True]
 
-    # keywords extra
     if keywords:
         t = df["title"].fillna("")
         s = df["summary"].fillna("")
@@ -335,7 +374,7 @@ def filter_and_format(df: pd.DataFrame, keywords, use_or: bool, include_all: boo
             for kw in keywords:
                 df = df[t.str.contains(kw, case=False) | s.str.contains(kw, case=False)]
 
-    # fechas — no expulsar NaT: solo filtra donde hay fecha
+    # Fechas: no expulsar NaT; solo filtra donde hay fecha
     if desde_dt is not None:
         has_date = df["pub_date"].notna()
         df = df[~has_date | (df["pub_date"] >= desde_dt)]
@@ -343,7 +382,6 @@ def filter_and_format(df: pd.DataFrame, keywords, use_or: bool, include_all: boo
         has_date = df["pub_date"].notna()
         df = df[~has_date | (df["pub_date"] <= hasta_dt)]
 
-    # dedup y orden
     df = df.drop_duplicates(subset=["url"], keep="first")
     df = df.sort_values(["pub_date","boletin"], ascending=[False, True], na_position="last")
     if limite:
@@ -352,13 +390,11 @@ def filter_and_format(df: pd.DataFrame, keywords, use_or: bool, include_all: boo
 
 def run_pipeline(opts):
     raw = []
-
     # BOJA
     if opts["use_boja_feeds"]:
         raw += fetch_boja_feeds(opts["boja_feed_urls"])
     if opts["use_boja_hist"]:
         raw += fetch_boja_range(opts["boja_year"], opts["boja_start"], opts["boja_end"])
-
     # BOE
     if opts["use_boe_rss"]:
         raw += fetch_boe_rss()
@@ -386,7 +422,7 @@ def run_pipeline(opts):
 st.title("Ayudas y Subvenciones · BOJA + BOE (disposiciones/consejerías + diario)")
 
 with st.sidebar:
-    st.header("Fuentes a consultar")
+    st.header("Fuentes")
     use_boja_feeds = st.checkbox("BOJA · Feeds oficiales (Atom)", value=True)
     use_boja_hist  = st.checkbox("BOJA · Histórico por número", value=False)
     use_boe_rss    = st.checkbox("BOE · RSS del día", value=True)
@@ -394,9 +430,9 @@ with st.sidebar:
 
     st.markdown("---")
     st.header("Filtros de contenido")
-    kw = st.text_input("Palabras clave extra (;). Base: ayuda|subvenci", "")
-    use_or = st.toggle("Usar OR entre palabras extra", value=True)
-    include_all = st.toggle("Incluir TODO (ignora filtro base de ayudas)", value=False)
+    kw = st.text_input("Palabras clave extra (;). Base: ayuda|subvenci|convocatoria|bases reguladoras", "")
+    use_or = st.toggle("OR entre palabras extra", value=True)
+    include_all = st.toggle("Incluir TODO (ignorar filtro base de ayudas)", value=False)
     lim = st.number_input("Límite total", 0, 10000, 1000, 50)
 
     st.markdown("---")
@@ -410,9 +446,9 @@ with st.sidebar:
         sel_sections = st.multiselect(
             "Secciones",
             boja_opts,
-            default=["Boletín completo", "Disposiciones generales (S51)"]
+            default=["Boletín completo", "Disposiciones generales (S51)"]  # evita S63/S69 si te dan 404
         )
-        boja_feed_urls = [BOJA_FEEDS_MAP[k] for k in sel_sections]
+        boja_feed_urls = selected_boja_urls_from_keys(sel_sections)
     else:
         boja_feed_urls = []
 
@@ -457,7 +493,7 @@ if run:
 
     st.caption(f"Entradas brutas → BOJA: {counts.get('BOJA',0)} | BOE: {counts.get('BOE',0)}")
     if df.empty:
-        st.warning("Sin resultados. Sube cobertura (activa histórico/fechas), deja keywords extra vacías y/o activa 'Incluir TODO' para validar entrada.")
+        st.warning("Sin resultados. Valida fuentes: desactiva keywords extra y, si hace falta, activa 'Incluir TODO'. Si BOJA da timeouts, usa histórico por número.")
     else:
         st.success(f"{len(df)} resultados")
         st.dataframe(df, use_container_width=True, height=700)
@@ -465,4 +501,3 @@ if run:
 
     with st.expander("Diagnóstico (primeras 20 entradas crudas)"):
         st.dataframe(df_raw.head(20), use_container_width=True)
-
