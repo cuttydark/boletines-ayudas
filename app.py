@@ -359,7 +359,7 @@ def buscar_boja_historico(fecha_inicio, fecha_fin, contenido_completo=False):
     return resultados
 
 def filtrar_resultados(df, palabras_clave, solo_ayudas=True, busqueda_exacta=False):
-    """Filtra los resultados con regex mejorado"""
+    """Filtra los resultados con regex mejorado para búsqueda exacta de palabras"""
     if df.empty:
         return df
     
@@ -376,6 +376,61 @@ def filtrar_resultados(df, palabras_clave, solo_ayudas=True, busqueda_exacta=Fal
             df['Resumen'].fillna('').astype(str)
         )
     
+    # Filtro de ayudas/subvenciones
+    if solo_ayudas:
+        # Usar \b para word boundary - funciona bien para palabras sin acentos
+        patron_ayudas = r'\b(ayuda|ayudas|subvención|subvencion|subvenciones|convocatoria|convocatorias|bases\s+reguladoras)\b'
+        mascara_ayudas = df['_texto_busqueda'].str.contains(
+            patron_ayudas, 
+            case=False, 
+            regex=True, 
+            na=False
+        )
+        df = df[mascara_ayudas]
+    
+    # Filtro de palabras clave
+    if palabras_clave:
+        mascara_final = pd.Series([False] * len(df), index=df.index)
+        
+        for palabra in palabras_clave:
+            palabra = palabra.strip()
+            if palabra:
+                if busqueda_exacta:
+                    # SOLUCIÓN MEJORADA: Usar \b con escape correcto
+                    # Esto busca la palabra exacta, no dentro de otras
+                    palabra_escaped = re.escape(palabra)
+                    
+                    # Patrón con word boundary estándar
+                    # \b funciona correctamente cuando se usa con la palabra escapada
+                    patron = r'\b' + palabra_escaped + r'\b'
+                    
+                    mascara_palabra = df['_texto_busqueda'].str.contains(
+                        patron, 
+                        case=False,  # Case insensitive
+                        regex=True, 
+                        na=False
+                    )
+                else:
+                    # Búsqueda normal (substring)
+                    mascara_palabra = df['_texto_busqueda'].str.contains(
+                        palabra, 
+                        case=False, 
+                        regex=False, 
+                        na=False
+                    )
+                
+                mascara_final = mascara_final | mascara_palabra
+        
+        df = df[mascara_final]
+    
+    # Limpiar columnas auxiliares
+    df = df.drop(columns=['_texto_busqueda'])
+    
+    if 'Contenido_Completo' in df.columns:
+        df = df.drop(columns=['Contenido_Completo'])
+    
+    return df
+
     # Filtro de ayudas/subvenciones
     if solo_ayudas:
         patron_ayudas = r'\b(ayuda|subvención|subvencion|convocatoria|bases\s+reguladoras)\b'
