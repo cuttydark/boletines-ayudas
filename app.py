@@ -166,18 +166,32 @@ def filtrar_resultados(df, palabras_clave, solo_ayudas=True):
     if df.empty:
         return df
     
+    # Crear columna de texto completo ANTES de filtrar
+    df['_texto_busqueda'] = (
+        df['Título'].fillna('').astype(str) + ' ' + 
+        df['Resumen'].fillna('').astype(str)
+    )
+    
     # Filtro de ayudas/subvenciones
     if solo_ayudas:
-        patron_ayudas = r'\bayuda(s)?\b|\bsubvenci(ón|ones)\b|\bconvocatoria(s)?\b|\bbases reguladoras\b'
-        texto_completo = df['Título'].fillna('') + ' ' + df['Resumen'].fillna('')
-        df = df[texto_completo.str.contains(patron_ayudas, case=False, regex=True, na=False)]
+        patron_ayudas = r'ayuda|subvenci|convocatoria|bases reguladoras'
+        mascara_ayudas = df['_texto_busqueda'].str.contains(patron_ayudas, case=False, regex=True, na=False)
+        df = df[mascara_ayudas]
     
-    # Filtro de palabras clave adicionales
+    # Filtro de palabras clave adicionales (modo OR, no AND)
     if palabras_clave:
+        mascara_final = pd.Series([False] * len(df), index=df.index)
+        
         for palabra in palabras_clave:
-            if palabra.strip():
-                texto_completo = df['Título'].fillna('') + ' ' + df['Resumen'].fillna('')
-                df = df[texto_completo.str.contains(palabra.strip(), case=False, na=False)]
+            palabra = palabra.strip()
+            if palabra:
+                mascara_palabra = df['_texto_busqueda'].str.contains(palabra, case=False, regex=False, na=False)
+                mascara_final = mascara_final | mascara_palabra
+        
+        df = df[mascara_final]
+    
+    # Eliminar columna auxiliar
+    df = df.drop(columns=['_texto_busqueda'])
     
     return df
 
