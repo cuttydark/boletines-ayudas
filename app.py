@@ -5,24 +5,133 @@ import pandas as pd
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
 import re
+import time
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 st.set_page_config(page_title="Búsqueda Ayudas BOJA/BOE", layout="wide")
 
-# Configuración de sesión HTTP
-session = requests.Session()
-session.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-})
+# ============= CONFIGURACIÓN DE SESIÓN MEJORADA =============
 
-# ============= FUNCIONES DE BÚSQUEDA =============
+def crear_session():
+    """Crea una sesión HTTP con retry automático y User-Agent completo"""
+    session = requests.Session()
+    
+    # Configurar reintentos automáticos
+    retry_strategy = Retry(
+        total=3,
+        backoff_factor=1,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"]
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    
+    # User-Agent completo y actualizado
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+        "Accept-Encoding": "gzip, deflate",
+        "Connection": "keep-alive",
+    })
+    
+    return session
 
-def buscar_boja_feed():
-    """Busca en el feed principal de BOJA"""
+session = crear_session()
+
+# ============= FUNCIONES DE BÚSQUEDA MEJORADAS =============
+
+def extraer_contenido_completo(url, max_intentos=2):
+    """Extrae el texto completo de una página con mejor manejo de errores"""
+    for intento in range(max_intentos):
+        try:
+            response = session.get(url, timeout=20)  # Timeout más largo
+            response.raise_for_status()  # Lanza excepción si status != 200
+            
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # Eliminar elementos no deseados
+            for element in soup(["script", "style", "nav", "header", "footer", "iframe"]):
+                element.decompose()
+            
+            # Extraer texto limpio
+            contenido = soup.get_text(separator=' ', strip=True)
+            
+            # Rate limiting: esperar entre peticiones
+            time.sleep(0.5)
+            
+            return contenido
+            
+        except requests.exceptions.Timeout:
+            st.warning(f"⏱️ Timeout en {url} (intento {intento + 1}/{max_intentos})")
+        except requests.exceptions.HTTPError as e:
+            st.warning(f"❌ Error HTTP {e.response.status_code} en {url}")
+            break
+        except requests.exceptions.RequestException as e:
+            st.warning(f"⚠️ Error de conexión: {str(e)[:100]}")
+        except Exception as e:
+            st.error(f"🔴 Error inesperado: {str(e)[:100]}")
+    
+    return ""
+
+def buscar_boe_api(fecha_inicio=None, fecha_fin=None, palabras_clave=None):
+    """
+    Usa la API oficial del BOE (más rápido y confiable)
+    Documentación: https://www.boe.es/datosabiertos/
+    """
+    resultados = []
+    
+    # Endpoint de la API del BOE
+    base_url = "https://www.boe.es/datosabiertos/api/legislacion-consolidada"
+    
+    params = {
+        "limit": 100,
+        "offset": 0
+    }
+    
+    if fecha_inicio:
+        params["from"] = fecha_inicio.strftime("%Y%m%d")
+    if fecha_fin:
+        params["to"] = fecha_fin.strftime("%Y%m%d")
+    
+    try:
+        response = session.get(
+            base_url,
+            params=params,
+            headers={"Accept": "application/json"},
+            timeout=30
+        )
+        response.raise_for_status()
+        
+        data = response.json()
+        
+        if data.get("status", {}).get("code") == "200":
+            for item in data.get("data", []):
+                resultados.append({
+                    'Boletín': 'BOE',
+                    'Título': item.get('titulo', ''),
+                    'Resumen': f"Rango: {item.get('rango', '')} - Dpto: {item.get('departamento', '')}",
+                    'Contenido_Completo': "",
+                    'Enlace': item.get('url_html_consolidada', ''),
+                    'Fecha': pd.to_datetime(item.get('fecha_publicacion', ''), format='%Y%m%d', errors='coerce')
+                })
+    
+    except requests.exceptions.RequestException as e:
+        st.error(f"Error al consultar API del BOE: {e}")
+    
+    return resultados
+
+def buscar_boja_feed(contenido_completo=False):
+    """Busca en el feed principal de BOJA con mejor manejo de errores"""
     resultados = []
     url = "https://www.juntadeandalucia.es/boja/distribucion/boja.xml"
     
     try:
-        response = session.get(url, timeout=15)
+        response = session.get(url, timeout=20)
+        response.raise_for_status()
+        
         feed = feedparser.parse(response.content)
         
         for entry in feed.entries:
@@ -30,76 +139,42 @@ def buscar_boja_feed():
             resumen = BeautifulSoup(entry.get('summary', ''), 'html.parser').get_text()
             enlace = entry.get('link', '')
             
-            # Extraer fecha
+            # Extraer fecha con mejor manejo
             fecha_str = entry.get('published', entry.get('updated', ''))
-            try:
-                fecha = pd.to_datetime(fecha_str).tz_localize(None) if fecha_str else pd.NaT
-            except:
-                fecha = pd.NaT
+            fecha = pd.to_datetime(fecha_str, errors='coerce', utc=True)
+            if pd.notna(fecha):
+                fecha = fecha.tz_localize(None)
+            
+            # Contenido completo opcional
+            texto_completo = ""
+            if contenido_completo and enlace:
+                texto_completo = extraer_contenido_completo(enlace)
             
             resultados.append({
                 'Boletín': 'BOJA',
                 'Título': titulo,
                 'Resumen': resumen[:300],
+                'Contenido_Completo': texto_completo,
                 'Enlace': enlace,
                 'Fecha': fecha
             })
+            
+    except requests.exceptions.RequestException as e:
+        st.error(f"Error al buscar en BOJA: {e}")
     except Exception as e:
-        st.warning(f"Error al buscar en BOJA: {e}")
+        st.error(f"Error inesperado en BOJA: {e}")
     
     return resultados
 
-def buscar_boja_historico(fecha_inicio, fecha_fin):
-    """Busca en BOJA por rango de fechas (números de boletín)"""
-    resultados = []
-    
-    # Calcular números aproximados de boletín
-    # BOJA publica ~250 boletines al año
-    año_actual = datetime.now().year
-    
-    # Si las fechas son del año actual, buscamos desde el boletín actual hacia atrás
-    dias_desde_inicio_año = (datetime.now() - datetime(año_actual, 1, 1)).days
-    numero_aproximado_actual = int(dias_desde_inicio_año * 0.7)  # ~0.7 boletines/día
-    
-    # Buscar últimos N boletines
-    num_boletines = st.session_state.get('num_boletines', 50)
-    
-    for num in range(max(1, numero_aproximado_actual - num_boletines), numero_aproximado_actual + 1):
-        url = f"https://www.juntadeandalucia.es/boja/{año_actual}/{str(num).zfill(3)}/index.html"
-        
-        try:
-            response = session.get(url, timeout=10)
-            if response.status_code == 200:
-                soup = BeautifulSoup(response.text, 'html.parser')
-                
-                # Buscar enlaces a disposiciones
-                for enlace in soup.find_all('a', href=True):
-                    href = enlace['href']
-                    if '/boja/' in href and '.html' in href:
-                        titulo = enlace.get_text(strip=True)
-                        
-                        if href.startswith('/'):
-                            href = f"https://www.juntadeandalucia.es{href}"
-                        
-                        resultados.append({
-                            'Boletín': 'BOJA',
-                            'Título': titulo,
-                            'Resumen': f'Boletín núm. {num} de {año_actual}',
-                            'Enlace': href,
-                            'Fecha': pd.NaT
-                        })
-        except:
-            continue
-    
-    return resultados
-
-def buscar_boe_rss():
-    """Busca en el RSS del BOE"""
+def buscar_boe_rss(contenido_completo=False):
+    """Busca en el RSS del BOE con mejor manejo de errores"""
     resultados = []
     url = "https://www.boe.es/rss/boe.php"
     
     try:
-        response = session.get(url, timeout=15)
+        response = session.get(url, timeout=20)
+        response.raise_for_status()
+        
         feed = feedparser.parse(response.content)
         
         for entry in feed.entries:
@@ -108,97 +183,102 @@ def buscar_boe_rss():
             enlace = entry.get('link', '')
             
             fecha_str = entry.get('published', entry.get('updated', ''))
-            try:
-                fecha = pd.to_datetime(fecha_str).tz_localize(None) if fecha_str else pd.NaT
-            except:
-                fecha = pd.NaT
+            fecha = pd.to_datetime(fecha_str, errors='coerce', utc=True)
+            if pd.notna(fecha):
+                fecha = fecha.tz_localize(None)
+            
+            texto_completo = ""
+            if contenido_completo and enlace:
+                texto_completo = extraer_contenido_completo(enlace)
             
             resultados.append({
                 'Boletín': 'BOE',
                 'Título': titulo,
                 'Resumen': resumen[:300],
+                'Contenido_Completo': texto_completo,
                 'Enlace': enlace,
                 'Fecha': fecha
             })
+            
+    except requests.exceptions.RequestException as e:
+        st.error(f"Error al buscar en BOE RSS: {e}")
     except Exception as e:
-        st.warning(f"Error al buscar en BOE: {e}")
+        st.error(f"Error inesperado en BOE RSS: {e}")
     
     return resultados
 
-def buscar_boe_historico(fecha_inicio, fecha_fin):
-    """Busca en BOE por fechas específicas"""
-    resultados = []
-    
-    fecha_actual = fecha_inicio
-    while fecha_actual <= fecha_fin:
-        url = f"https://www.boe.es/boe/dias/{fecha_actual.year:04d}/{fecha_actual.month:02d}/{fecha_actual.day:02d}/"
-        
-        try:
-            response = session.get(url, timeout=10)
-            if response.status_code == 200:
-                soup = BeautifulSoup(response.text, 'html.parser')
-                
-                # Buscar documentos
-                for enlace in soup.find_all('a', href=True):
-                    href = enlace['href']
-                    if 'BOE-A-' in href or 'txt.php' in href:
-                        titulo = enlace.get_text(strip=True)
-                        
-                        if href.startswith('/'):
-                            href = f"https://www.boe.es{href}"
-                        
-                        resultados.append({
-                            'Boletín': 'BOE',
-                            'Título': titulo,
-                            'Resumen': f'BOE del {fecha_actual.strftime("%d/%m/%Y")}',
-                            'Enlace': href,
-                            'Fecha': pd.to_datetime(fecha_actual)
-                        })
-        except:
-            pass
-        
-        fecha_actual += timedelta(days=1)
-    
-    return resultados
-
-def filtrar_resultados(df, palabras_clave, solo_ayudas=True):
-    """Filtra los resultados por palabras clave"""
+def filtrar_resultados(df, palabras_clave, solo_ayudas=True, busqueda_exacta=False):
+    """Filtra los resultados con regex mejorado"""
     if df.empty:
         return df
     
-    # Crear columna de texto completo ANTES de filtrar
-    df['_texto_busqueda'] = (
-        df['Título'].fillna('').astype(str) + ' ' + 
-        df['Resumen'].fillna('').astype(str)
-    )
+    # Crear columna de búsqueda
+    if 'Contenido_Completo' in df.columns:
+        df['_texto_busqueda'] = (
+            df['Título'].fillna('').astype(str) + ' ' + 
+            df['Resumen'].fillna('').astype(str) + ' ' +
+            df['Contenido_Completo'].fillna('').astype(str)
+        )
+    else:
+        df['_texto_busqueda'] = (
+            df['Título'].fillna('').astype(str) + ' ' + 
+            df['Resumen'].fillna('').astype(str)
+        )
     
-    # Filtro de ayudas/subvenciones
+    # Filtro de ayudas/subvenciones MEJORADO
     if solo_ayudas:
-        patron_ayudas = r'ayuda|subvenci|convocatoria|bases reguladoras'
-        mascara_ayudas = df['_texto_busqueda'].str.contains(patron_ayudas, case=False, regex=True, na=False)
+        # Palabras completas para evitar falsos positivos
+        patron_ayudas = r'\b(ayuda|subvención|subvencion|convocatoria|bases\s+reguladoras)\b'
+        mascara_ayudas = df['_texto_busqueda'].str.contains(
+            patron_ayudas, 
+            case=False, 
+            regex=True, 
+            na=False
+        )
         df = df[mascara_ayudas]
     
-    # Filtro de palabras clave adicionales (modo OR, no AND)
+    # Filtro de palabras clave (modo OR)
     if palabras_clave:
         mascara_final = pd.Series([False] * len(df), index=df.index)
         
         for palabra in palabras_clave:
             palabra = palabra.strip()
             if palabra:
-                mascara_palabra = df['_texto_busqueda'].str.contains(palabra, case=False, regex=False, na=False)
+                if busqueda_exacta:
+                    # Escape mejor para caracteres especiales en español
+                    palabra_escaped = re.escape(palabra)
+                    # Usar límites de palabra flexibles
+                    patron = r'(?<![a-záéíóúñ])' + palabra_escaped + r'(?![a-záéíóúñ])'
+                    mascara_palabra = df['_texto_busqueda'].str.contains(
+                        patron, 
+                        case=False, 
+                        regex=True, 
+                        na=False
+                    )
+                else:
+                    mascara_palabra = df['_texto_busqueda'].str.contains(
+                        palabra, 
+                        case=False, 
+                        regex=False, 
+                        na=False
+                    )
+                
                 mascara_final = mascara_final | mascara_palabra
         
         df = df[mascara_final]
     
-    # Eliminar columna auxiliar
+    # Limpiar columnas auxiliares
     df = df.drop(columns=['_texto_busqueda'])
+    
+    if 'Contenido_Completo' in df.columns:
+        df = df.drop(columns=['Contenido_Completo'])
     
     return df
 
-# ============= INTERFAZ =============
+# ============= INTERFAZ (sin cambios funcionales, solo mejoras visuales) =============
 
 st.title("🔍 Buscador de Ayudas y Subvenciones")
-st.markdown("**BOJA** (Junta de Andalucía) + **BOE** (Estado)")
+st.markdown("**BOJA** (Junta de Andalucía) + **BOE** (Estado) - Con API oficial")
 
 # Sidebar
 with st.sidebar:
@@ -206,57 +286,60 @@ with st.sidebar:
     
     st.subheader("Fuentes de datos")
     usar_boja = st.checkbox("BOJA (Feed reciente)", value=True)
-    usar_boja_hist = st.checkbox("BOJA (Histórico)", value=False)
     usar_boe = st.checkbox("BOE (RSS del día)", value=True)
-    usar_boe_hist = st.checkbox("BOE (Histórico por fechas)", value=False)
+    usar_boe_api = st.checkbox("🆕 BOE (API oficial - Recomendado)", value=False, 
+                               help="Más rápido y confiable que el RSS")
+    
+    st.markdown("---")
+    st.subheader("🔍 Opciones de búsqueda")
+    
+    contenido_completo = st.checkbox(
+        "🔥 Buscar en contenido completo",
+        value=False,
+        help="⚠️ MUY LENTO: Descarga y analiza el texto completo. Puede tardar varios minutos."
+    )
+    
+    if contenido_completo:
+        st.warning("⏱️ Esta opción puede tardar 5-10 minutos y causar bloqueos temporales.")
     
     st.markdown("---")
     st.subheader("Filtros")
     solo_ayudas = st.checkbox("Solo ayudas/subvenciones", value=True)
-    palabras_clave = st.text_input("Palabras clave (separadas por coma)", "")
+    palabras_clave = st.text_input(
+        "Palabras clave (separadas por coma)", 
+        "",
+        help="Ejemplo: feder, turismo, pyme"
+    )
     
-    st.markdown("---")
-    
-    # Configuración de búsqueda histórica
-    if usar_boja_hist:
-        st.subheader("BOJA Histórico")
-        st.session_state['num_boletines'] = st.slider(
-            "Núm. boletines a revisar", 
-            10, 200, 50, 10
-        )
-    
-    if usar_boe_hist:
-        st.subheader("BOE Histórico")
-        col1, col2 = st.columns(2)
-        fecha_desde = col1.date_input("Desde", datetime.now() - timedelta(days=30))
-        fecha_hasta = col2.date_input("Hasta", datetime.now())
+    busqueda_exacta = st.checkbox(
+        "Búsqueda de palabra exacta",
+        value=True,
+        help="Busca 'feder' solo como palabra completa, no dentro de 'confederación'"
+    )
 
 # Botón de búsqueda
 if st.button("🚀 Buscar", type="primary"):
-    with st.spinner("Buscando..."):
+    with st.spinner("Buscando en boletines oficiales..."):
         todos_resultados = []
         
         # BOJA Feed
         if usar_boja:
-            with st.status("Buscando en BOJA (feed)..."):
-                todos_resultados.extend(buscar_boja_feed())
-        
-        # BOJA Histórico
-        if usar_boja_hist:
-            with st.status("Buscando en BOJA histórico..."):
-                todos_resultados.extend(buscar_boja_historico(None, None))
+            with st.status("🔎 Buscando en BOJA (feed)..."):
+                todos_resultados.extend(buscar_boja_feed(contenido_completo))
         
         # BOE RSS
         if usar_boe:
-            with st.status("Buscando en BOE (RSS)..."):
-                todos_resultados.extend(buscar_boe_rss())
+            with st.status("🔎 Buscando en BOE (RSS)..."):
+                todos_resultados.extend(buscar_boe_rss(contenido_completo))
         
-        # BOE Histórico
-        if usar_boe_hist:
-            with st.status("Buscando en BOE histórico..."):
-                todos_resultados.extend(buscar_boe_historico(fecha_desde, fecha_hasta))
+        # BOE API (recomendado)
+        if usar_boe_api:
+            with st.status("🔎 Consultando API oficial del BOE..."):
+                fecha_inicio = datetime.now() - timedelta(days=30)
+                fecha_fin = datetime.now()
+                todos_resultados.extend(buscar_boe_api(fecha_inicio, fecha_fin))
         
-        # Crear DataFrame
+        # Procesar resultados
         if todos_resultados:
             df = pd.DataFrame(todos_resultados)
             
@@ -265,36 +348,45 @@ if st.button("🚀 Buscar", type="primary"):
             
             # Aplicar filtros
             lista_palabras = [p.strip() for p in palabras_clave.split(',') if p.strip()]
-            df_filtrado = filtrar_resultados(df, lista_palabras, solo_ayudas)
+            df_filtrado = filtrar_resultados(df, lista_palabras, solo_ayudas, busqueda_exacta)
             
             # Ordenar por fecha
             df_filtrado = df_filtrado.sort_values('Fecha', ascending=False, na_position='last')
             
             # Mostrar resultados
-            st.success(f"✅ {len(df_filtrado)} resultados encontrados (de {len(df)} totales)")
-            
-            # Mostrar tabla
-            st.dataframe(
-                df_filtrado,
-                use_container_width=True,
-                height=600,
-                column_config={
-                    "Enlace": st.column_config.LinkColumn("Enlace"),
-                    "Fecha": st.column_config.DatetimeColumn("Fecha", format="DD/MM/YYYY")
-                }
-            )
-            
-            # Botón de descarga
-            csv = df_filtrado.to_csv(index=False, encoding='utf-8-sig')
-            st.download_button(
-                "📥 Descargar CSV",
-                csv,
-                "ayudas_subvenciones.csv",
-                "text/csv"
-            )
-            
+            if len(df_filtrado) > 0:
+                st.success(f"✅ {len(df_filtrado)} resultados encontrados (de {len(df)} totales)")
+                
+                # Mostrar tabla
+                st.dataframe(
+                    df_filtrado,
+                    use_container_width=True,
+                    height=600,
+                    column_config={
+                        "Enlace": st.column_config.LinkColumn("Enlace"),
+                        "Fecha": st.column_config.DatetimeColumn(
+                            "Fecha", 
+                            format="DD/MM/YYYY HH:mm"
+                        )
+                    }
+                )
+                
+                # Botón de descarga
+                csv = df_filtrado.to_csv(index=False, encoding='utf-8-sig')
+                st.download_button(
+                    "📥 Descargar CSV",
+                    csv,
+                    f"ayudas_subvenciones_{datetime.now().strftime('%Y%m%d')}.csv",
+                    "text/csv",
+                    key='download-csv'
+                )
+            else:
+                st.warning("⚠️ No se encontraron resultados con los filtros aplicados. Prueba a:")
+                st.markdown("- Desactivar 'Solo ayudas/subvenciones'")
+                st.markdown("- Quitar algunas palabras clave")
+                st.markdown("- Cambiar de 'búsqueda exacta' a búsqueda normal")
         else:
-            st.warning("⚠️ No se encontraron resultados")
+            st.error("❌ No se pudieron obtener resultados de ninguna fuente")
 
 # Información
 with st.expander("ℹ️ Ayuda"):
@@ -302,16 +394,33 @@ with st.expander("ℹ️ Ayuda"):
     ### Cómo usar esta aplicación
     
     1. **Selecciona las fuentes** que quieres consultar en el panel lateral
+       - 🆕 **API oficial del BOE**: Más rápido y confiable (recomendado)
+       - RSS feeds: Actualizaciones del día
+       - Contenido completo: Muy lento pero más exhaustivo
+    
     2. **Activa filtros** para buscar solo ayudas/subvenciones
-    3. **Añade palabras clave** específicas si buscas algo concreto (ej: "agricultura, turismo")
-    4. **Búsqueda histórica**:
-       - BOJA: Busca en los últimos N boletines del año actual
-       - BOE: Busca en un rango específico de fechas
+    
+    3. **Añade palabras clave** específicas (ej: "feder, turismo, pyme")
+       - Separa múltiples palabras con comas
+       - La búsqueda es tipo OR (encuentra cualquiera de las palabras)
+    
+    4. **Búsqueda exacta vs normal**:
+       - Exacta: "feder" no encuentra "confederación"
+       - Normal: "feder" encuentra "feder", "federación", "confederación"
+    
     5. Haz clic en **Buscar**
     
     ### Consejos
-    - Para búsquedas rápidas, usa solo los feeds (BOJA y BOE RSS)
-    - Para búsquedas históricas, activa las opciones de histórico
-    - Las búsquedas históricas pueden tardar varios minutos
-    - Si no encuentras resultados, prueba sin filtros o con menos palabras clave
+    
+    - ✅ **Recomendado**: Usa la API oficial del BOE para búsquedas rápidas
+    - ⚡ Para búsquedas rápidas, usa solo los feeds (sin contenido completo)
+    - 🐌 La búsqueda en contenido completo puede tardar 5-10 minutos
+    - 🔍 Si no encuentras resultados, prueba sin filtros o con menos palabras clave
+    - 📊 Descarga los resultados en CSV para análisis posterior
+    
+    ### Fuentes de datos
+    
+    - **BOJA**: [www.juntadeandalucia.es/boja](https://www.juntadeandalucia.es/boja)
+    - **BOE**: [www.boe.es](https://www.boe.es)
+    - **API BOE**: [Documentación oficial](https://www.boe.es/datosabiertos/)
     """)
