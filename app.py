@@ -560,7 +560,7 @@ with st.sidebar:
         api_key_default = st.secrets.get("openai", {}).get("api_key", "")
     except:
         pass
-    
+
     if api_key_default:
         api_key_openai = api_key_default
         st.success("✅ API Key cargada desde configuración segura")
