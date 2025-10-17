@@ -6,10 +6,12 @@ from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
 import re
 import time
+import json
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from openai import OpenAI
 
-st.set_page_config(page_title="Búsqueda Ayudas BOJA/BOE", layout="wide")
+st.set_page_config(page_title="Búsqueda Ayudas BOJA/BOE con IA", layout="wide", page_icon="🔍")
 
 # ============= CONFIGURACIÓN DE SESIÓN MEJORADA =============
 
@@ -17,7 +19,6 @@ def crear_session():
     """Crea una sesión HTTP con retry automático y User-Agent completo"""
     session = requests.Session()
     
-    # Configurar reintentos automáticos
     retry_strategy = Retry(
         total=3,
         backoff_factor=1,
@@ -28,7 +29,6 @@ def crear_session():
     session.mount("http://", adapter)
     session.mount("https://", adapter)
     
-    # User-Agent completo y actualizado
     session.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -41,10 +41,145 @@ def crear_session():
 
 session = crear_session()
 
+# ============= FUNCIONES DE IA CON OPENAI =============
+
+def resumir_con_openai(texto, api_key, modelo="gpt-4o-mini", max_palabras=150):
+    """
+    Genera un resumen estructurado usando OpenAI API
+    """
+    try:
+        client = OpenAI(api_key=api_key)
+        
+        response = client.chat.completions.create(
+            model=modelo,
+            messages=[
+                {
+                    "role": "system",
+                    "content": """Eres un experto en analizar ayudas y subvenciones públicas españolas del BOE y BOJA. 
+Extrae información clave de forma estructurada y precisa en español."""
+                },
+                {
+                    "role": "user",
+                    "content": f"""Analiza este documento oficial y proporciona SOLO un JSON con esta estructura exacta:
+
+{{
+  "tipo": "tipo de documento (ej: Subvención, Convocatoria, Resolución, Bases reguladoras)",
+  "beneficiarios": "quién puede solicitarla (ej: PYMES, autónomos, entidades locales)",
+  "cuantia": "importe o porcentaje disponible",
+  "plazo": "fecha límite de solicitud o duración",
+  "resumen": "descripción breve en máximo {max_palabras} palabras"
+}}
+
+DOCUMENTO:
+{texto[:8000]}
+
+Responde SOLO con el JSON, sin texto adicional."""
+                }
+            ],
+            temperature=0.2,
+            max_tokens=600,
+            response_format={"type": "json_object"}
+        )
+        
+        resultado = json.loads(response.choices[0].message.content)
+        return resultado
+    
+    except Exception as e:
+        return {
+            "tipo": "Error al procesar",
+            "beneficiarios": "No disponible",
+            "cuantia": "No disponible",
+            "plazo": "No disponible",
+            "resumen": f"Error al generar resumen: {str(e)[:100]}",
+            "error": str(e)
+        }
+
+def busqueda_inteligente_openai(consulta_usuario, api_key, modelo="gpt-4o-mini"):
+    """
+    Convierte una consulta en lenguaje natural a palabras clave específicas
+    """
+    try:
+        client = OpenAI(api_key=api_key)
+        
+        response = client.chat.completions.create(
+            model=modelo,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "Eres un experto en ayudas públicas españolas. Convierte consultas naturales en palabras clave para búsqueda en BOE/BOJA."
+                },
+                {
+                    "role": "user",
+                    "content": f"""Un usuario busca: "{consulta_usuario}"
+
+Extrae las palabras clave MÁS RELEVANTES para buscar en el BOE/BOJA.
+Responde SOLO con las palabras clave separadas por comas, sin explicaciones.
+
+Ejemplos:
+- "ayudas para abrir un restaurante" → "hostelería, restauración, pyme, emprendimiento"
+- "subvenciones turismo rural Andalucía" → "turismo rural, alojamiento, feder, andalucía"
+- "financiación startups tecnológicas" → "startup, innovación, tecnología, emprendimiento, I+D"
+
+Palabras clave:"""
+                }
+            ],
+            temperature=0.3,
+            max_tokens=100
+        )
+        
+        palabras = response.choices[0].message.content.strip()
+        return palabras
+    
+    except Exception as e:
+        st.error(f"Error en búsqueda inteligente: {e}")
+        return consulta_usuario
+
+def analizar_relevancia_openai(titulo, resumen, palabras_objetivo, api_key, modelo="gpt-4o-mini"):
+    """
+    Usa IA para determinar si una ayuda es relevante según criterios del usuario
+    """
+    try:
+        client = OpenAI(api_key=api_key)
+        
+        response = client.chat.completions.create(
+            model=modelo,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "Eres un experto en ayudas públicas españolas. Evalúa la relevancia de documentos."
+                },
+                {
+                    "role": "user",
+                    "content": f"""Analiza si esta ayuda/subvención es relevante para alguien interesado en: {', '.join(palabras_objetivo)}
+
+TÍTULO: {titulo}
+RESUMEN: {resumen[:500]}
+
+Responde SOLO con un número del 0 al 10 donde:
+- 0-3: No relevante
+- 4-6: Moderadamente relevante
+- 7-10: Muy relevante
+
+Número:"""
+                }
+            ],
+            temperature=0.2,
+            max_tokens=10
+        )
+        
+        texto = response.choices[0].message.content.strip()
+        numeros = re.findall(r'\d+', texto)
+        if numeros:
+            return int(numeros[0])
+        return 5
+    
+    except:
+        return 5
+
 # ============= FUNCIONES DE BÚSQUEDA =============
 
 def extraer_contenido_completo(url, max_intentos=2):
-    """Extrae el texto completo de una página con mejor manejo de errores"""
+    """Extrae el texto completo de una página"""
     for intento in range(max_intentos):
         try:
             response = session.get(url, timeout=20)
@@ -52,14 +187,10 @@ def extraer_contenido_completo(url, max_intentos=2):
             
             soup = BeautifulSoup(response.text, 'html.parser')
             
-            # Eliminar elementos no deseados
             for element in soup(["script", "style", "nav", "header", "footer", "iframe"]):
                 element.decompose()
             
-            # Extraer texto limpio
             contenido = soup.get_text(separator=' ', strip=True)
-            
-            # Rate limiting
             time.sleep(0.5)
             
             return contenido
@@ -94,13 +225,11 @@ def buscar_boja_feed(contenido_completo=False):
             resumen = BeautifulSoup(entry.get('summary', ''), 'html.parser').get_text()
             enlace = entry.get('link', '')
             
-            # Extraer fecha
             fecha_str = entry.get('published', entry.get('updated', ''))
             fecha = pd.to_datetime(fecha_str, errors='coerce', utc=True)
             if pd.notna(fecha):
                 fecha = fecha.tz_localize(None)
             
-            # Contenido completo opcional
             texto_completo = ""
             if contenido_completo and enlace:
                 texto_completo = extraer_contenido_completo(enlace)
@@ -163,10 +292,7 @@ def buscar_boe_rss(contenido_completo=False):
     return resultados
 
 def buscar_boe_historico_api(fecha_inicio, fecha_fin, contenido_completo=False):
-    """
-    Busca en el BOE por rango de fechas usando la API oficial de sumarios
-    Documentación: https://www.boe.es/datosabiertos/documentos/APIsumarioBOE.pdf
-    """
+    """Busca en el BOE por rango de fechas usando la API oficial"""
     resultados = []
     fecha_actual = fecha_inicio
     
@@ -177,35 +303,25 @@ def buscar_boe_historico_api(fecha_inicio, fecha_fin, contenido_completo=False):
     dia_actual = 0
     
     while fecha_actual <= fecha_fin:
-        # Actualizar barra de progreso
         progreso = dia_actual / total_dias
         progress_bar.progress(progreso)
         progress_text.text(f"Consultando BOE del {fecha_actual.strftime('%d/%m/%Y')} ({dia_actual+1}/{total_dias})")
         
-        # Formato de fecha para la API: AAAAMMDD
         fecha_str = fecha_actual.strftime("%Y%m%d")
         url = f"https://www.boe.es/datosabiertos/api/boe/sumario/{fecha_str}"
         
         try:
-            response = session.get(
-                url,
-                headers={"Accept": "application/json"},
-                timeout=20
-            )
+            response = session.get(url, headers={"Accept": "application/json"}, timeout=20)
             
             if response.status_code == 200:
                 data = response.json()
                 
-                # Verificar respuesta correcta
                 if data.get("status", {}).get("code") == "200":
                     sumario = data.get("data", {}).get("sumario", {})
                     
-                    # Recorrer todas las secciones del BOE
                     for diario in sumario.get("diario", []):
                         for seccion in diario.get("seccion", []):
-                            # Procesar departamentos
                             for departamento in seccion.get("departamento", []):
-                                # Procesar epígrafes
                                 for epigrafe in departamento.get("epigrafe", []):
                                     items = epigrafe.get("item", [])
                                     if isinstance(items, dict):
@@ -228,7 +344,6 @@ def buscar_boe_historico_api(fecha_inicio, fecha_fin, contenido_completo=False):
                                             'Fecha': pd.to_datetime(fecha_actual)
                                         })
                                 
-                                # Procesar items directos
                                 items_directos = departamento.get("item", [])
                                 if isinstance(items_directos, dict):
                                     items_directos = [items_directos]
@@ -253,7 +368,6 @@ def buscar_boe_historico_api(fecha_inicio, fecha_fin, contenido_completo=False):
             elif response.status_code != 404:
                 st.warning(f"⚠️ Error {response.status_code} al consultar BOE del {fecha_actual.strftime('%d/%m/%Y')}")
             
-            # Rate limiting
             time.sleep(0.3)
             
         except requests.exceptions.RequestException as e:
@@ -286,7 +400,6 @@ def buscar_boja_historico(fecha_inicio, fecha_fin, contenido_completo=False):
     for año in años_a_procesar:
         progress_text.text(f"Consultando BOJA del año {año} ({año_idx+1}/{total_años})")
         
-        # Estimar rango de números de boletín
         if año == año_actual and año == año_fin:
             dia_inicio = fecha_inicio.timetuple().tm_yday
             dia_fin = fecha_fin.timetuple().tm_yday
@@ -359,11 +472,10 @@ def buscar_boja_historico(fecha_inicio, fecha_fin, contenido_completo=False):
     return resultados
 
 def filtrar_resultados(df, palabras_clave, solo_ayudas=True, busqueda_exacta=False):
-    """Filtra los resultados con regex mejorado para búsqueda exacta de palabras"""
+    """Filtra los resultados con regex mejorado"""
     if df.empty:
         return df
     
-    # Crear columna de búsqueda
     if 'Contenido_Completo' in df.columns:
         df['_texto_busqueda'] = (
             df['Título'].fillna('').astype(str) + ' ' + 
@@ -376,9 +488,7 @@ def filtrar_resultados(df, palabras_clave, solo_ayudas=True, busqueda_exacta=Fal
             df['Resumen'].fillna('').astype(str)
         )
     
-    # Filtro de ayudas/subvenciones
     if solo_ayudas:
-        # Usar \b para word boundary - funciona bien para palabras sin acentos
         patron_ayudas = r'\b(ayuda|ayudas|subvención|subvencion|subvenciones|convocatoria|convocatorias|bases\s+reguladoras)\b'
         mascara_ayudas = df['_texto_busqueda'].str.contains(
             patron_ayudas, 
@@ -388,7 +498,6 @@ def filtrar_resultados(df, palabras_clave, solo_ayudas=True, busqueda_exacta=Fal
         )
         df = df[mascara_ayudas]
     
-    # Filtro de palabras clave
     if palabras_clave:
         mascara_final = pd.Series([False] * len(df), index=df.index)
         
@@ -396,62 +505,8 @@ def filtrar_resultados(df, palabras_clave, solo_ayudas=True, busqueda_exacta=Fal
             palabra = palabra.strip()
             if palabra:
                 if busqueda_exacta:
-                    # SOLUCIÓN MEJORADA: Usar \b con escape correcto
-                    # Esto busca la palabra exacta, no dentro de otras
                     palabra_escaped = re.escape(palabra)
-                    
-                    # Patrón con word boundary estándar
-                    # \b funciona correctamente cuando se usa con la palabra escapada
                     patron = r'\b' + palabra_escaped + r'\b'
-                    
-                    mascara_palabra = df['_texto_busqueda'].str.contains(
-                        patron, 
-                        case=False,  # Case insensitive
-                        regex=True, 
-                        na=False
-                    )
-                else:
-                    # Búsqueda normal (substring)
-                    mascara_palabra = df['_texto_busqueda'].str.contains(
-                        palabra, 
-                        case=False, 
-                        regex=False, 
-                        na=False
-                    )
-                
-                mascara_final = mascara_final | mascara_palabra
-        
-        df = df[mascara_final]
-    
-    # Limpiar columnas auxiliares
-    df = df.drop(columns=['_texto_busqueda'])
-    
-    if 'Contenido_Completo' in df.columns:
-        df = df.drop(columns=['Contenido_Completo'])
-    
-    return df
-
-    # Filtro de ayudas/subvenciones
-    if solo_ayudas:
-        patron_ayudas = r'\b(ayuda|subvención|subvencion|convocatoria|bases\s+reguladoras)\b'
-        mascara_ayudas = df['_texto_busqueda'].str.contains(
-            patron_ayudas, 
-            case=False, 
-            regex=True, 
-            na=False
-        )
-        df = df[mascara_ayudas]
-    
-    # Filtro de palabras clave
-    if palabras_clave:
-        mascara_final = pd.Series([False] * len(df), index=df.index)
-        
-        for palabra in palabras_clave:
-            palabra = palabra.strip()
-            if palabra:
-                if busqueda_exacta:
-                    palabra_escaped = re.escape(palabra)
-                    patron = r'(?<![a-záéíóúñ])' + palabra_escaped + r'(?![a-záéíóúñ])'
                     mascara_palabra = df['_texto_busqueda'].str.contains(
                         patron, 
                         case=False, 
@@ -470,7 +525,6 @@ def filtrar_resultados(df, palabras_clave, solo_ayudas=True, busqueda_exacta=Fal
         
         df = df[mascara_final]
     
-    # Limpiar columnas auxiliares
     df = df.drop(columns=['_texto_busqueda'])
     
     if 'Contenido_Completo' in df.columns:
@@ -480,36 +534,93 @@ def filtrar_resultados(df, palabras_clave, solo_ayudas=True, busqueda_exacta=Fal
 
 # ============= INTERFAZ =============
 
-st.title("🔍 Buscador de Ayudas y Subvenciones")
-st.markdown("**BOJA** (Junta de Andalucía) + **BOE** (Estado) - Con API oficial")
+st.title("🔍 Buscador Inteligente de Ayudas y Subvenciones")
+st.markdown("**BOJA** (Junta de Andalucía) + **BOE** (Estado) - Con IA de OpenAI")
 
 # Sidebar
 with st.sidebar:
     st.header("⚙️ Configuración")
     
-    st.subheader("Fuentes de datos")
+    # ============= CONFIGURACIÓN DE IA =============
+    st.subheader("🤖 Inteligencia Artificial")
     
-    # Fuentes recientes
-    st.markdown("**📰 Publicaciones recientes**")
-    usar_boja = st.checkbox("BOJA (Feed del día)", value=True)
-    usar_boe = st.checkbox("BOE (RSS del día)", value=True)
+    usar_ia = st.checkbox(
+        "Activar resúmenes con IA",
+        value=False,
+        help="Genera resúmenes automáticos estructurados de cada ayuda"
+    )
+    
+    api_key_openai = None
+    modelo_openai = None
+    
+    if usar_ia:
+        api_key_openai = st.text_input(
+            "🔑 API Key de OpenAI:",
+            type="password",
+            help="Obtén tu API key en: https://platform.openai.com/api-keys"
+        )
+        
+        if api_key_openai:
+            modelo_openai = st.selectbox(
+                "Modelo OpenAI:",
+                ["gpt-4o-mini", "gpt-4o", "gpt-3.5-turbo"],
+                help="gpt-4o-mini: $0.15/1M tokens (recomendado)\ngpt-4o: $2.50/1M tokens (más potente)"
+            )
+            
+            st.info(f"💰 Costo estimado por resumen: ~$0.001 con {modelo_openai}")
+        else:
+            st.warning("⚠️ Ingresa tu API Key de OpenAI para usar IA")
+    
+    # Búsqueda inteligente
+    st.markdown("---")
+    busqueda_inteligente = st.checkbox(
+        "🔮 Búsqueda inteligente con IA",
+        value=False,
+        help="Describe lo que buscas en lenguaje natural"
+    )
+    
+    palabras_clave = ""
+    
+    if busqueda_inteligente and api_key_openai:
+        consulta_natural = st.text_area(
+            "Describe lo que buscas:",
+            placeholder="Ejemplo: Busco ayudas para abrir un negocio de turismo rural en Andalucía con fondos europeos",
+            height=100
+        )
+        
+        if st.button("🔮 Generar palabras clave", type="secondary"):
+            if consulta_natural:
+                with st.spinner("Analizando tu consulta con IA..."):
+                    palabras_generadas = busqueda_inteligente_openai(
+                        consulta_natural, 
+                        api_key_openai, 
+                        modelo_openai or "gpt-4o-mini"
+                    )
+                    st.success(f"✅ Palabras clave: **{palabras_generadas}**")
+                    palabras_clave = palabras_generadas
+            else:
+                st.warning("Escribe una consulta primero")
     
     st.markdown("---")
     
-    # Búsqueda histórica
+    # ============= FUENTES DE DATOS =============
+    st.subheader("📰 Fuentes de datos")
+    
+    usar_boja = st.checkbox("BOJA (Feed del día)", value=True)
+    usar_boe = st.checkbox("BOE (RSS del día)", value=True)
+    
     st.markdown("**📅 Búsqueda histórica**")
     usar_boja_hist = st.checkbox(
         "BOJA (Histórico por fechas)", 
         value=False,
-        help="Busca en boletines anteriores de BOJA por rango de fechas"
+        help="Busca en boletines anteriores"
     )
     usar_boe_hist = st.checkbox(
-        "BOE (Histórico por fechas - API oficial)", 
+        "BOE (Histórico - API oficial)", 
         value=False,
-        help="Busca en BOE usando la API oficial de sumarios"
+        help="Busca usando la API oficial"
     )
     
-    # Selector de fechas
     fecha_desde = None
     fecha_hasta = None
     
@@ -534,58 +645,59 @@ with st.sidebar:
         
         dias_rango = (fecha_hasta - fecha_desde).days
         if dias_rango > 90:
-            st.warning(f"⏱️ Rango amplio ({dias_rango} días). Puede tardar varios minutos.")
+            st.warning(f"⏱️ Rango amplio ({dias_rango} días)")
     
     st.markdown("---")
     
+    # ============= OPCIONES DE BÚSQUEDA =============
     st.subheader("🔍 Opciones de búsqueda")
     
     contenido_completo = st.checkbox(
         "🔥 Buscar en contenido completo",
         value=False,
-        help="⚠️ MUY LENTO: Descarga y analiza el texto completo. Puede tardar varios minutos."
+        help="⚠️ MUY LENTO: Descarga y analiza el texto completo"
     )
     
     if contenido_completo:
-        st.warning("⏱️ Esta opción puede tardar 5-10 minutos o más con búsquedas históricas.")
+        st.warning("⏱️ Puede tardar 5-10 minutos o más")
     
     st.markdown("---")
     
-    st.subheader("Filtros")
+    # ============= FILTROS =============
+    st.subheader("🎯 Filtros")
     solo_ayudas = st.checkbox("Solo ayudas/subvenciones", value=True)
-    palabras_clave = st.text_input(
-        "Palabras clave (separadas por coma)", 
-        "",
-        help="Ejemplo: feder, turismo, pyme"
-    )
+    
+    if not busqueda_inteligente:
+        palabras_clave = st.text_input(
+            "Palabras clave (separadas por coma)", 
+            "",
+            help="Ejemplo: feder, turismo, pyme"
+        )
     
     busqueda_exacta = st.checkbox(
         "Búsqueda de palabra exacta",
         value=True,
-        help="Busca 'feder' solo como palabra completa, no dentro de 'confederación'"
+        help="'feder' no encuentra 'confederación'"
     )
 
-# Botón de búsqueda
+# ============= BOTÓN DE BÚSQUEDA =============
 if st.button("🚀 Buscar", type="primary"):
     if (usar_boja_hist or usar_boe_hist) and fecha_desde and fecha_hasta and fecha_desde > fecha_hasta:
-        st.error("❌ Por favor corrige el rango de fechas antes de buscar")
+        st.error("❌ Corrige el rango de fechas")
     else:
         with st.spinner("Buscando en boletines oficiales..."):
             todos_resultados = []
             
-            # BOJA Feed reciente
             if usar_boja:
                 with st.status("🔎 Buscando en BOJA (feed reciente)..."):
                     todos_resultados.extend(buscar_boja_feed(contenido_completo))
             
-            # BOE RSS reciente
             if usar_boe:
                 with st.status("🔎 Buscando en BOE (RSS reciente)..."):
                     todos_resultados.extend(buscar_boe_rss(contenido_completo))
             
-            # BOJA Histórico
             if usar_boja_hist and fecha_desde and fecha_hasta:
-                with st.status(f"🔎 Buscando en BOJA histórico ({fecha_desde} a {fecha_hasta})..."):
+                with st.status(f"🔎 Buscando en BOJA histórico..."):
                     todos_resultados.extend(
                         buscar_boja_historico(
                             datetime.combine(fecha_desde, datetime.min.time()),
@@ -594,9 +706,8 @@ if st.button("🚀 Buscar", type="primary"):
                         )
                     )
             
-            # BOE Histórico
             if usar_boe_hist and fecha_desde and fecha_hasta:
-                with st.status(f"🔎 Consultando BOE histórico ({fecha_desde} a {fecha_hasta})..."):
+                with st.status(f"🔎 Consultando BOE histórico..."):
                     todos_resultados.extend(
                         buscar_boe_historico_api(
                             datetime.combine(fecha_desde, datetime.min.time()),
@@ -608,42 +719,110 @@ if st.button("🚀 Buscar", type="primary"):
             # Procesar resultados
             if todos_resultados:
                 df = pd.DataFrame(todos_resultados)
-                
-                # Eliminar duplicados
                 df = df.drop_duplicates(subset=['Enlace'], keep='first')
                 
-                # Aplicar filtros
                 lista_palabras = [p.strip() for p in palabras_clave.split(',') if p.strip()]
                 df_filtrado = filtrar_resultados(df, lista_palabras, solo_ayudas, busqueda_exacta)
-                
-                # Ordenar por fecha
                 df_filtrado = df_filtrado.sort_values('Fecha', ascending=False, na_position='last')
                 
-                # Mostrar resultados
                 if len(df_filtrado) > 0:
                     st.success(f"✅ **{len(df_filtrado)} resultados** encontrados (de {len(df)} totales)")
                     
-                    # Estadísticas
                     col1, col2, col3 = st.columns(3)
                     col1.metric("Total resultados", len(df_filtrado))
                     col2.metric("BOJA", len(df_filtrado[df_filtrado['Boletín'] == 'BOJA']))
                     col3.metric("BOE", len(df_filtrado[df_filtrado['Boletín'] == 'BOE']))
                     
-                    # Mostrar tabla
+                    # ============= RESÚMENES CON IA =============
+                    if usar_ia and api_key_openai:
+                        st.markdown("---")
+                        st.subheader("🤖 Resúmenes generados con IA")
+                        
+                        max_resumenes = st.slider(
+                            "Número de ayudas a resumir:",
+                            min_value=1,
+                            max_value=min(20, len(df_filtrado)),
+                            value=min(5, len(df_filtrado)),
+                            help="Cada resumen tarda ~2-5 segundos"
+                        )
+                        
+                        if st.button("📝 Generar resúmenes con IA", type="primary"):
+                            resumenes = []
+                            progress_bar = st.progress(0)
+                            progress_text = st.empty()
+                            
+                            for idx, (_, row) in enumerate(df_filtrado.head(max_resumenes).iterrows()):
+                                progress_bar.progress((idx + 1) / max_resumenes)
+                                progress_text.text(f"Resumiendo {idx+1}/{max_resumenes}: {row['Título'][:50]}...")
+                                
+                                texto_completo = row.get('Contenido_Completo', '')
+                                if not texto_completo and row['Enlace']:
+                                    texto_completo = extraer_contenido_completo(row['Enlace'])
+                                
+                                texto_para_ia = f"{row['Título']}\n\n{row['Resumen']}\n\n{texto_completo[:6000]}"
+                                
+                                resumen_ia = resumir_con_openai(
+                                    texto_para_ia, 
+                                    api_key_openai, 
+                                    modelo_openai
+                                )
+                                
+                                resumenes.append({
+                                    **row.to_dict(),
+                                    **resumen_ia
+                                })
+                            
+                            progress_bar.empty()
+                            progress_text.empty()
+                            
+                            # Mostrar resúmenes
+                            for res in resumenes:
+                                with st.expander(f"📄 {res['Título'][:100]}...", expanded=False):
+                                    col1, col2 = st.columns([2, 1])
+                                    
+                                    with col1:
+                                        st.markdown(f"**🎯 Tipo:** {res.get('tipo', 'N/A')}")
+                                        st.markdown(f"**👥 Beneficiarios:** {res.get('beneficiarios', 'N/A')}")
+                                        st.markdown(f"**💰 Cuantía:** {res.get('cuantia', 'N/A')}")
+                                        st.markdown(f"**📅 Plazo:** {res.get('plazo', 'N/A')}")
+                                    
+                                    with col2:
+                                        st.markdown(f"**📰 Boletín:** {res['Boletín']}")
+                                        if pd.notna(res.get('Fecha')):
+                                            st.markdown(f"**📆 Fecha:** {res['Fecha'].strftime('%d/%m/%Y')}")
+                                        st.markdown(f"[🔗 Ver documento]({res['Enlace']})")
+                                    
+                                    st.markdown("---")
+                                    st.markdown(f"**📝 Resumen IA:**")
+                                    st.info(res.get('resumen', 'No disponible'))
+                            
+                            # Exportar
+                            df_resumenes = pd.DataFrame(resumenes)
+                            columnas_export = ['Boletín', 'Título', 'tipo', 'beneficiarios', 'cuantia', 'plazo', 'resumen', 'Enlace', 'Fecha']
+                            columnas_disponibles = [col for col in columnas_export if col in df_resumenes.columns]
+                            
+                            csv_resumenes = df_resumenes[columnas_disponibles].to_csv(index=False, encoding='utf-8-sig')
+                            st.download_button(
+                                "📥 Descargar resúmenes con IA (CSV)",
+                                csv_resumenes,
+                                f"resumenes_ia_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                                "text/csv",
+                                key='download-resumenes'
+                            )
+                    
+                    # Tabla original
+                    st.markdown("---")
+                    st.subheader("📊 Tabla de resultados")
                     st.dataframe(
                         df_filtrado,
                         use_container_width=True,
                         height=600,
                         column_config={
                             "Enlace": st.column_config.LinkColumn("Enlace"),
-                            "Fecha": st.column_config.DatetimeColumn(
-                                "Fecha", 
-                                format="DD/MM/YYYY"
-                            )
+                            "Fecha": st.column_config.DatetimeColumn("Fecha", format="DD/MM/YYYY")
                         }
                     )
                     
-                    # Botón de descarga
                     csv = df_filtrado.to_csv(index=False, encoding='utf-8-sig')
                     st.download_button(
                         "📥 Descargar CSV",
@@ -653,56 +832,63 @@ if st.button("🚀 Buscar", type="primary"):
                         key='download-csv'
                     )
                 else:
-                    st.warning("⚠️ No se encontraron resultados con los filtros aplicados")
-                    st.info("💡 **Sugerencias:**\n- Desactiva 'Solo ayudas/subvenciones'\n- Reduce las palabras clave\n- Cambia a búsqueda no exacta\n- Amplía el rango de fechas")
+                    st.warning("⚠️ No se encontraron resultados")
+                    st.info("💡 **Sugerencias:**\n- Desactiva 'Solo ayudas/subvenciones'\n- Reduce palabras clave\n- Cambia a búsqueda no exacta\n- Amplía el rango de fechas")
             else:
-                st.error("❌ No se pudieron obtener resultados de ninguna fuente")
+                st.error("❌ No se obtuvieron resultados")
 
-# Información
-with st.expander("ℹ️ Ayuda"):
+# ============= INFORMACIÓN =============
+with st.expander("ℹ️ Ayuda y Guía de Uso"):
     st.markdown("""
-    ### Cómo usar esta aplicación
+    ### 🎯 Cómo usar esta aplicación
     
-    1. **Selecciona las fuentes** que quieres consultar en el panel lateral
-       - **Feed del día**: Publicaciones más recientes (rápido)
-       - **Histórico**: Busca en fechas anteriores (más lento)
+    #### 1. Configurar OpenAI (opcional pero recomendado)
+    - Obtén tu API Key en: https://platform.openai.com/api-keys
+    - Pégala en el campo "API Key de OpenAI"
+    - Esto activará resúmenes inteligentes y búsqueda en lenguaje natural
     
-    2. **Configura las fechas** (solo para búsqueda histórica)
-       - Selecciona el rango "Desde" y "Hasta"
-       - Recomendado: máximo 90 días
+    #### 2. Seleccionar fuentes
+    - **Feed del día**: Publicaciones más recientes (rápido)
+    - **Histórico**: Busca en fechas anteriores (más lento)
     
-    3. **Activa filtros**
-       - ✅ Solo ayudas/subvenciones: Filtra por palabras clave relacionadas
-       - 🔍 Palabras clave: Busca términos específicos (ej: "feder, turismo, pyme")
-       - 📝 Búsqueda exacta: Encuentra solo palabras completas
+    #### 3. Búsqueda inteligente con IA
+    - Activa "Búsqueda inteligente con IA"
+    - Describe en lenguaje natural lo que buscas
+    - Ejemplo: "Busco financiación para startups tecnológicas en Andalucía"
+    - La IA convertirá tu consulta en palabras clave óptimas
     
-    4. **Búsqueda en contenido completo** (opcional)
-       - ⚠️ Muy lento pero más exhaustivo
-       - Descarga cada documento completo
-       - Puede tardar 5-10 minutos
+    #### 4. Búsqueda tradicional (sin IA)
+    - Introduce palabras clave separadas por comas
+    - Ejemplo: "feder, turismo, pyme"
+    - Activa "búsqueda exacta" para mayor precisión
     
-    5. Haz clic en **🚀 Buscar**
+    #### 5. Generar resúmenes con IA
+    - Después de buscar, activa "Generar resúmenes con IA"
+    - Selecciona cuántas ayudas resumir (máx. 20)
+    - La IA extraerá: tipo, beneficiarios, cuantía, plazo y resumen
     
-    ### Consejos
+    ### 💰 Costos de OpenAI
     
-    - ✅ **Recomendado**: Usa feeds del día para búsquedas rápidas
-    - ⚡ Para búsquedas históricas, usa la API del BOE (más rápida)
-    - 🐌 Evita "contenido completo" para rangos amplios
-    - 🔍 Si no encuentras resultados, prueba con menos filtros
-    - 📊 Descarga los resultados en CSV para análisis posterior
+    - **gpt-4o-mini**: ~$0.001 por resumen (recomendado)
+    - **gpt-4o**: ~$0.003 por resumen (más potente)
+    - Resumir 10 ayudas: ~$0.01-0.03 USD
     
-    ### Tipos de búsqueda
+    ### 🔍 Tipos de búsqueda
     
-    **Búsqueda exacta** (activada):
-    - "feder" → encuentra: "FEDER", "Feder"
-    - "feder" → NO encuentra: "federación", "confederación"
+    **Exacta** (activada):
+    - "feder" encuentra: "FEDER", "Feder"
+    - NO encuentra: "federación", "confederación"
     
-    **Búsqueda normal** (desactivada):
-    - "feder" → encuentra: "FEDER", "federación", "confederación"
+    **Normal** (desactivada):
+    - "feder" encuentra todo lo anterior
     
-    ### Fuentes de datos
+    ### 📊 Fuentes oficiales
     
-    - **BOJA**: [www.juntadeandalucia.es/boja](https://www.juntadeandalucia.es/boja)
-    - **BOE**: [www.boe.es](https://www.boe.es)
-    - **API BOE**: [Documentación oficial](https://www.boe.es/datosabiertos/)
+    - **BOJA**: https://www.juntadeandalucia.es/boja
+    - **BOE**: https://www.boe.es
+    - **API BOE**: https://www.boe.es/datosabiertos/
     """)
+
+# Footer
+st.markdown("---")
+st.markdown("🤖 **Desarrollado con Streamlit + OpenAI** | 📅 Actualizado: Octubre 2025")
