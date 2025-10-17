@@ -542,54 +542,58 @@ with st.sidebar:
     st.header("⚙️ Configuración")
     
     # ============= CONFIGURACIÓN DE IA =============
-st.subheader("🤖 Inteligencia Artificial")
-
-usar_ia = st.checkbox(
-    "Activar resúmenes con IA",
-    value=False,
-    help="Genera resúmenes automáticos estructurados de cada ayuda"
-)
-
-api_key_openai = None
-modelo_openai = None
-
-if usar_ia:
-    # Intentar cargar desde secrets, si no existe mostrar input
-    api_key_default = ""
-    try:
-        api_key_default = st.secrets.get("openai", {}).get("api_key", "")
-    except:
-        pass
+# Sidebar
+with st.sidebar:
+    st.header("⚙️ Configuración")
     
-    if api_key_default:
-        api_key_openai = api_key_default
-        st.success("✅ API Key cargada desde configuración segura")
-    else:
-        api_key_openai = st.text_input(
-            "🔑 API Key de OpenAI:",
-            type="password",
-            help="Obtén tu API key en: https://platform.openai.com/api-keys"
-        )
+    # ============= CONFIGURACIÓN DE IA =============
+    st.subheader("🤖 Inteligencia Artificial")
     
-    if api_key_openai:
-        modelo_openai = st.selectbox(
-            "Modelo OpenAI:",
-            ["gpt-4o-mini", "gpt-4o", "gpt-3.5-turbo"],
-            help="gpt-4o-mini: $0.15/1M tokens (recomendado)\ngpt-4o: $2.50/1M tokens (más potente)"
-        )
+    usar_ia = st.checkbox(
+        "Activar resúmenes con IA",
+        value=False,
+        help="Genera resúmenes automáticos estructurados de cada ayuda"
+    )
+    
+    api_key_openai = None
+    modelo_openai = None
+    
+    if usar_ia:
+        # Intentar cargar desde secrets, si no existe mostrar input
+        api_key_default = ""
+        try:
+            api_key_default = st.secrets.get("openai", {}).get("api_key", "")
+        except:
+            pass
         
-        st.info(f"💰 Costo estimado por resumen: ~$0.001 con {modelo_openai}")
-    else:
-        st.warning("⚠️ Ingresa tu API Key de OpenAI para usar IA")
-
-# Búsqueda inteligente
-st.markdown("---")
-busqueda_inteligente = st.checkbox(
-    "🔮 Búsqueda inteligente con IA",
-    value=False,
-    help="Describe lo que buscas en lenguaje natural"
-)
-
+        if api_key_default:
+            api_key_openai = api_key_default
+            st.success("✅ API Key cargada desde configuración segura")
+        else:
+            api_key_openai = st.text_input(
+                "🔑 API Key de OpenAI:",
+                type="password",
+                help="Obtén tu API key en: https://platform.openai.com/api-keys"
+            )
+        
+        if api_key_openai:
+            modelo_openai = st.selectbox(
+                "Modelo OpenAI:",
+                ["gpt-4o-mini", "gpt-4o", "gpt-3.5-turbo"],
+                help="gpt-4o-mini: $0.15/1M tokens (recomendado)\ngpt-4o: $2.50/1M tokens (más potente)"
+            )
+            
+            st.info(f"💰 Costo estimado por resumen: ~$0.001 con {modelo_openai}")
+        else:
+            st.warning("⚠️ Ingresa tu API Key de OpenAI para usar IA")
+    
+    # Búsqueda inteligente
+    st.markdown("---")
+    busqueda_inteligente = st.checkbox(
+        "🔮 Búsqueda inteligente con IA",
+        value=False,
+        help="Describe lo que buscas en lenguaje natural"
+    )
     
     palabras_clave = ""
     
@@ -691,18 +695,7 @@ busqueda_inteligente = st.checkbox(
         value=True,
         help="'feder' no encuentra 'confederación'"
     )
-
-# ============= BOTÓN DE BÚSQUEDA =============
-if st.button("🚀 Buscar", type="primary"):
-    if (usar_boja_hist or usar_boe_hist) and fecha_desde and fecha_hasta and fecha_desde > fecha_hasta:
-        st.error("❌ Corrige el rango de fechas")
-    else:
-        with st.spinner("Buscando en boletines oficiales..."):
-            todos_resultados = []
-            
-            if usar_boja:
-                with st.status("🔎 Buscando en BOJA (feed reciente)..."):
-                    todos_resultados.extend(buscar_boja_feed(contenido_completo))
+    
             
             if usar_boe:
                 with st.status("🔎 Buscando en BOE (RSS reciente)..."):
