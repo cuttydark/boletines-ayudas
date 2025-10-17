@@ -44,9 +44,7 @@ session = crear_session()
 # ============= FUNCIONES DE IA CON OPENAI =============
 
 def resumir_con_openai(texto, api_key, modelo="gpt-4o-mini", max_palabras=150):
-    """
-    Genera un resumen estructurado usando OpenAI API
-    """
+    """Genera un resumen estructurado usando OpenAI API"""
     try:
         client = OpenAI(api_key=api_key)
         
@@ -95,9 +93,7 @@ Responde SOLO con el JSON, sin texto adicional."""
         }
 
 def busqueda_inteligente_openai(consulta_usuario, api_key, modelo="gpt-4o-mini"):
-    """
-    Convierte una consulta en lenguaje natural a palabras clave específicas
-    """
+    """Convierte una consulta en lenguaje natural a palabras clave específicas"""
     try:
         client = OpenAI(api_key=api_key)
         
@@ -135,9 +131,7 @@ Palabras clave:"""
         return consulta_usuario
 
 def analizar_relevancia_openai(titulo, resumen, palabras_objetivo, api_key, modelo="gpt-4o-mini"):
-    """
-    Usa IA para determinar si una ayuda es relevante según criterios del usuario
-    """
+    """Usa IA para determinar si una ayuda es relevante según criterios del usuario"""
     try:
         client = OpenAI(api_key=api_key)
         
@@ -542,11 +536,6 @@ with st.sidebar:
     st.header("⚙️ Configuración")
     
     # ============= CONFIGURACIÓN DE IA =============
-# Sidebar
-with st.sidebar:
-    st.header("⚙️ Configuración")
-    
-    # ============= CONFIGURACIÓN DE IA =============
     st.subheader("🤖 Inteligencia Artificial")
     
     usar_ia = st.checkbox(
@@ -695,7 +684,18 @@ with st.sidebar:
         value=True,
         help="'feder' no encuentra 'confederación'"
     )
-    
+
+# ============= BOTÓN DE BÚSQUEDA =============
+if st.button("🚀 Buscar", type="primary"):
+    if (usar_boja_hist or usar_boe_hist) and fecha_desde and fecha_hasta and fecha_desde > fecha_hasta:
+        st.error("❌ Corrige el rango de fechas")
+    else:
+        with st.spinner("Buscando en boletines oficiales..."):
+            todos_resultados = []
+            
+            if usar_boja:
+                with st.status("🔎 Buscando en BOJA (feed reciente)..."):
+                    todos_resultados.extend(buscar_boja_feed(contenido_completo))
             
             if usar_boe:
                 with st.status("🔎 Buscando en BOE (RSS reciente)..."):
@@ -897,3 +897,4 @@ with st.expander("ℹ️ Ayuda y Guía de Uso"):
 # Footer
 st.markdown("---")
 st.markdown("🤖 **Desarrollado con Streamlit + OpenAI** | 📅 Actualizado: Octubre 2025")
+
