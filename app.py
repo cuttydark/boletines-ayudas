@@ -554,11 +554,23 @@ with st.sidebar:
     modelo_openai = None
     
     if usar_ia:
+    # Intentar cargar desde secrets, si no existe mostrar input
+    api_key_default = ""
+    try:
+        api_key_default = st.secrets.get("openai", {}).get("api_key", "")
+    except:
+        pass
+    
+    if api_key_default:
+        api_key_openai = api_key_default
+        st.success("✅ API Key cargada desde configuración segura")
+    else:
         api_key_openai = st.text_input(
             "🔑 API Key de OpenAI:",
             type="password",
             help="Obtén tu API key en: https://platform.openai.com/api-keys"
         )
+
         
         if api_key_openai:
             modelo_openai = st.selectbox(
