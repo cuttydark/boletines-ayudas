@@ -378,87 +378,176 @@ def buscar_boe_historico_api(fecha_inicio, fecha_fin, contenido_completo=False):
     return resultados
 
 def buscar_boja_historico(fecha_inicio, fecha_fin, contenido_completo=False):
-    """Busca en BOJA por rango de fechas"""
+    """Busca en BOJA histórico usando la API oficial de datos abiertos"""
     resultados = []
-    
-    año_actual = fecha_inicio.year
-    año_fin = fecha_fin.year
     
     progress_text = st.empty()
     progress_bar = st.progress(0)
     
-    años_a_procesar = list(range(año_actual, año_fin + 1))
+    años_a_procesar = list(range(fecha_inicio.year, fecha_fin.year + 1))
     total_años = len(años_a_procesar)
     año_idx = 0
     
     for año in años_a_procesar:
         progress_text.text(f"Consultando BOJA del año {año} ({año_idx+1}/{total_años})")
+        progress_bar.progress(año_idx / total_años)
         
-        if año == año_actual and año == año_fin:
-            dia_inicio = fecha_inicio.timetuple().tm_yday
-            dia_fin = fecha_fin.timetuple().tm_yday
-            num_inicio = int(dia_inicio * 0.7)
-            num_fin = int(dia_fin * 0.7)
-        elif año == año_actual:
-            dia_inicio = fecha_inicio.timetuple().tm_yday
-            num_inicio = int(dia_inicio * 0.7)
-            num_fin = 250
-        elif año == año_fin:
-            dia_fin = fecha_fin.timetuple().tm_yday
-            num_inicio = 1
-            num_fin = int(dia_fin * 0.7)
-        else:
-            num_inicio = 1
-            num_fin = 250
+        # URL de la API oficial del BOJA
+        url_api = f"https://www.juntadeandalucia.es/datosabiertos/portal/api/3/action/package_search"
         
-        total_nums = num_fin - num_inicio + 1
+        # Parámetros para filtrar por año
+        params = {
+            "q": f"boja {año}",
+            "rows": 1000,  # Máximo de resultados
+        }
         
-        for idx, num in enumerate(range(max(1, num_inicio), min(num_fin + 1, 300))):
-            progress_bar.progress((año_idx + idx/total_nums) / total_años)
+        try:
+            response = session.get(url_api, params=params, timeout=30)
             
-            url_indice = f"https://www.juntadeandalucia.es/boja/{año}/{str(num).zfill(3)}/index.html"
-            
-            try:
-                response = session.get(url_indice, timeout=15)
+            if response.status_code == 200:
+                data = response.json()
                 
-                if response.status_code == 200:
-                    soup = BeautifulSoup(response.text, 'html.parser')
+                if data.get("success"):
+                    datasets = data.get("result", {}).get("results", [])
                     
-                    for enlace in soup.find_all('a', href=True):
-                        href = enlace['href']
+                    for dataset in datasets:
+                        # Extraer información del dataset
+                        titulo = dataset.get("title", "")
+                        notas = dataset.get("notes", "")
                         
-                        if '/boja/' in href and '.html' in href and href != url_indice:
-                            titulo = enlace.get_text(strip=True)
+                        # Obtener recursos (PDFs, HTMLs, etc.)
+                        recursos = dataset.get("resources", [])
+                        
+                        for recurso in recursos:
+                            url_recurso = recurso.get("url", "")
+                            formato = recurso.get("format", "").upper()
                             
-                            if href.startswith('/'):
-                                href_completo = f"https://www.juntadeandalucia.es{href}"
-                            elif href.startswith('http'):
-                                href_completo = href
-                            else:
-                                href_completo = f"https://www.juntadeandalucia.es/boja/{año}/{str(num).zfill(3)}/{href}"
+                            # Filtrar por fecha si está disponible
+                            fecha_pub = dataset.get("metadata_created", "")
+                            fecha_obj = None
                             
+                            if fecha_pub:
+                                try:
+                                    fecha_obj = pd.to_datetime(fecha_pub)
+                                    
+                                    # Filtrar por rango de fechas
+                                    if fecha_obj < pd.to_datetime(fecha_inicio) or fecha_obj > pd.to_datetime(fecha_fin):
+                                        continue
+                                except:
+                                    pass
+                            
+                            # Extraer contenido completo si se solicita
                             texto_completo = ""
-                            if contenido_completo:
-                                texto_completo = extraer_contenido_completo(href_completo)
+                            if contenido_completo and url_recurso and formato in ["HTML", "HTM"]:
+                                texto_completo = extraer_contenido_completo(url_recurso)
                             
                             resultados.append({
                                 'Boletín': 'BOJA',
                                 'Título': titulo,
-                                'Resumen': f'Boletín núm. {num} de {año}',
+                                'Resumen': notas[:300],
                                 'Contenido_Completo': texto_completo,
-                                'Enlace': href_completo,
-                                'Fecha': pd.NaT
+                                'Enlace': url_recurso,
+                                'Fecha': fecha_obj
                             })
-                
-                time.sleep(0.2)
-                
-            except requests.exceptions.RequestException:
-                continue
-            except Exception as e:
-                st.warning(f"Error procesando BOJA {año}/{num}: {str(e)[:100]}")
+            
+            time.sleep(0.5)
+            
+        except requests.exceptions.RequestException as e:
+            st.warning(f"Error al consultar BOJA API para año {año}: {str(e)[:100]}")
+        except Exception as e:
+            st.error(f"Error procesando BOJA del año {año}: {str(e)[:100]}")
         
         año_idx += 1
-        progress_bar.progress(año_idx / total_años)
+    
+    progress_bar.empty()
+    progress_text.empty()
+    
+    # Si no hay resultados con la API, intentar método alternativo
+    if not resultados:
+        st.warning("⚠️ La API no devolvió resultados. Intentando método alternativo...")
+        resultados = buscar_boja_historico_alternativo(fecha_inicio, fecha_fin, contenido_completo)
+    
+    return resultados
+
+
+def buscar_boja_historico_alternativo(fecha_inicio, fecha_fin, contenido_completo=False):
+    """Método alternativo: busca en BOJA usando scraping directo con URLs mejoradas"""
+    resultados = []
+    fecha_actual = fecha_inicio
+    
+    progress_text = st.empty()
+    progress_bar = st.progress(0)
+    
+    total_dias = (fecha_fin - fecha_actual).days + 1
+    dia_actual = 0
+    
+    # Intentar diferentes patrones de URL
+    patrones_url = [
+        "https://www.juntadeandalucia.es/eboja/{}",  # Nuevo formato e-BOJA
+        "https://www.juntadeandalucia.es/boja/{}",    # Formato antiguo
+    ]
+    
+    while fecha_actual <= fecha_fin:
+        progreso = dia_actual / total_dias
+        progress_bar.progress(progreso)
+        progress_text.text(f"Buscando BOJA del {fecha_actual.strftime('%d/%m/%Y')} ({dia_actual+1}/{total_dias})")
+        
+        año = fecha_actual.year
+        fecha_str = fecha_actual.strftime("%Y-%m-%d")
+        
+        # Intentar diferentes formatos de fecha
+        formatos_fecha = [
+            fecha_actual.strftime("%Y/%m/%d"),
+            fecha_actual.strftime("%Y/%m/%d/index.html"),
+            fecha_actual.strftime("%Y/%Y%m%d"),
+        ]
+        
+        for patron_base in patrones_url:
+            for formato_fecha in formatos_fecha:
+                url_prueba = patron_base.format(formato_fecha)
+                
+                try:
+                    response = session.get(url_prueba, timeout=10)
+                    
+                    if response.status_code == 200:
+                        soup = BeautifulSoup(response.text, 'html.parser')
+                        
+                        # Buscar enlaces a disposiciones
+                        for enlace in soup.find_all('a', href=True):
+                            href = enlace['href']
+                            titulo = enlace.get_text(strip=True)
+                            
+                            # Filtrar enlaces relevantes
+                            if titulo and len(titulo) > 10:
+                                if href.startswith('/'):
+                                    href_completo = f"https://www.juntadeandalucia.es{href}"
+                                elif not href.startswith('http'):
+                                    href_completo = f"https://www.juntadeandalucia.es/{href}"
+                                else:
+                                    href_completo = href
+                                
+                                texto_completo = ""
+                                if contenido_completo:
+                                    texto_completo = extraer_contenido_completo(href_completo)
+                                
+                                resultados.append({
+                                    'Boletín': 'BOJA',
+                                    'Título': titulo,
+                                    'Resumen': f'BOJA del {fecha_actual.strftime("%d/%m/%Y")}',
+                                    'Contenido_Completo': texto_completo,
+                                    'Enlace': href_completo,
+                                    'Fecha': pd.to_datetime(fecha_actual)
+                                })
+                        
+                        break  # Si encontró resultados, no probar más formatos
+                    
+                except requests.exceptions.RequestException:
+                    continue
+                
+                time.sleep(0.2)
+        
+        fecha_actual += timedelta(days=1)
+        dia_actual += 1
     
     progress_bar.empty()
     progress_text.empty()
