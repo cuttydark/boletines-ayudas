@@ -204,7 +204,7 @@ def extraer_contenido_completo(url, max_intentos=2):
     return ""
 
 def buscar_boja_feed(contenido_completo=False):
-    """Busca en el feed principal de BOJA"""
+    """Busca en el feed principal de BOJA con filtrado mejorado"""
     resultados = []
     url = "https://www.juntadeandalucia.es/boja/distribucion/boja.xml"
     
@@ -218,6 +218,25 @@ def buscar_boja_feed(contenido_completo=False):
             titulo = entry.get('title', '')
             resumen = BeautifulSoup(entry.get('summary', ''), 'html.parser').get_text()
             enlace = entry.get('link', '')
+            
+            # ============= FILTRO MEJORADO =============
+            # Excluir enlaces a páginas institucionales genéricas
+            urls_excluir = [
+                '/temas/',
+                '/organismos/',
+                '/servicios/',
+                'juntadeandalucia.es/temas',
+                'juntadeandalucia.es/organismos'
+            ]
+            
+            # Verificar si el enlace es a un documento oficial del BOJA
+            if any(excluir in enlace for excluir in urls_excluir):
+                continue  # Saltar este resultado
+            
+            # Verificar que el enlace contenga un número de BOJA
+            if '/boja/' not in enlace and '/eboja/' not in enlace:
+                continue  # Solo aceptar enlaces a boletines oficiales
+            # ============= FIN FILTRO =============
             
             fecha_str = entry.get('published', entry.get('updated', ''))
             fecha = pd.to_datetime(fecha_str, errors='coerce', utc=True)
@@ -380,41 +399,100 @@ def buscar_boe_historico_api(fecha_inicio, fecha_fin, contenido_completo=False):
 # ============= NUEVA FUNCIÓN MEJORADA PARA BOJA HISTÓRICO =============
 
 def buscar_boja_historico(fecha_inicio, fecha_fin, contenido_completo=False):
-    """Busca en BOJA histórico usando múltiples métodos"""
+    """Busca en BOJA histórico usando el feed RSS y filtrando por fechas"""
+    
+    st.info("🔍 Buscando en BOJA mediante feed RSS histórico...")
+    
+    # Primero, obtener todos los resultados del feed RSS
+    resultados_feed = buscar_boja_feed(contenido_completo=False)
+    
+    if not resultados_feed:
+        st.warning("⚠️ No se pudieron obtener datos del feed RSS")
+        return []
+    
+    # Convertir a DataFrame para filtrar por fechas
+    df_feed = pd.DataFrame(resultados_feed)
+    
+    # Filtrar por rango de fechas
+    fecha_inicio_pd = pd.to_datetime(fecha_inicio)
+    fecha_fin_pd = pd.to_datetime(fecha_fin)
+    
+    # Aplicar filtro de fechas (solo si hay fechas válidas)
+    if 'Fecha' in df_feed.columns:
+        mascara_fechas = (df_feed['Fecha'] >= fecha_inicio_pd) & (df_feed['Fecha'] <= fecha_fin_pd)
+        df_filtrado = df_feed[mascara_fechas]
+    else:
+        df_filtrado = df_feed
+    
+    st.info(f"📊 Encontrados {len(df_filtrado)} documentos del BOJA en el rango de fechas")
+    
+    # Si el feed RSS no tiene suficiente historia, intentar otros métodos
+    if len(df_filtrado) == 0 and (fecha_fin_pd - fecha_inicio_pd).days > 30:
+        st.warning("⚠️ El feed RSS solo contiene documentos recientes. Intentando método alternativo...")
+        return buscar_boja_historico_profundo(fecha_inicio, fecha_fin, contenido_completo)
+    
+    # Convertir de vuelta a lista de diccionarios
+    resultados = df_filtrado.to_dict('records')
+    
+    # Obtener contenido completo si se solicita
+    if contenido_completo and len(resultados) > 0:
+        progress_bar = st.progress(0)
+        progress_text = st.empty()
+        
+        for idx, resultado in enumerate(resultados):
+            progress_bar.progress((idx + 1) / len(resultados))
+            progress_text.text(f"Extrayendo contenido {idx+1}/{len(resultados)}...")
+            
+            if resultado['Enlace']:
+                resultado['Contenido_Completo'] = extraer_contenido_completo(resultado['Enlace'])
+            
+            time.sleep(0.3)
+        
+        progress_bar.empty()
+        progress_text.empty()
+    
+    return resultados
+
+
+def buscar_boja_historico_profundo(fecha_inicio, fecha_fin, contenido_completo=False):
+    """Búsqueda profunda para fechas antiguas (más de 30 días)"""
+    
+    st.info("🔍 Búsqueda profunda activada para fechas antiguas...")
+    
     resultados = []
+    fecha_actual = fecha_inicio
     
     progress_text = st.empty()
     progress_bar = st.progress(0)
     
-    fecha_actual = fecha_inicio
     total_dias = (fecha_fin - fecha_actual).days + 1
     dia_actual = 0
-    
-    # Método 1: Intentar con el buscador oficial del e-BOJA
-    st.info("🔍 Método 1: Buscando en e-BOJA oficial...")
     
     while fecha_actual <= fecha_fin:
         progress_bar.progress(dia_actual / total_dias)
         progress_text.text(f"Consultando BOJA del {fecha_actual.strftime('%d/%m/%Y')} ({dia_actual+1}/{total_dias})")
         
-        # URL del nuevo e-BOJA
         año = fecha_actual.year
         
-        # Calcular número de boletín aproximado (más preciso)
+        # Calcular número de boletín aproximado
+        # El BOJA publica de lunes a viernes, aproximadamente 200-250 boletines/año
         dia_año = fecha_actual.timetuple().tm_yday
-        # Los boletines se publican de lunes a viernes (aproximadamente 250 boletines/año)
-        num_boletin = int((dia_año / 365) * 250)
         
-        # Probar varios números alrededor del estimado
-        for offset in range(-5, 6):
-            num_prueba = max(1, num_boletin + offset)
+        # Calcular días hábiles aproximados hasta la fecha
+        dias_habiles_estimados = int((dia_año / 365) * 200)
+        
+        # Probar un rango de números de boletín alrededor del estimado
+        for offset in range(-10, 11):
+            num_boletin = max(1, min(250, dias_habiles_estimados + offset))
             
-            # Formatos de URL a probar
+            # Probar diferentes formatos de URL
             urls_probar = [
-                f"https://www.juntadeandalucia.es/eboja/{año}/{str(num_prueba).zfill(3)}/",
-                f"https://www.juntadeandalucia.es/boja/{año}/{str(num_prueba).zfill(3)}/index.html",
-                f"https://www.juntadeandalucia.es/eboja/{año}/{str(num_prueba).zfill(3)}/index.html",
+                f"https://www.juntadeandalucia.es/boja/{año}/{str(num_boletin).zfill(3)}/",
+                f"https://www.juntadeandalucia.es/eboja/{año}/{str(num_boletin).zfill(3)}/",
+                f"https://www.juntadeandalucia.es/boja/{año}/{str(num_boletin).zfill(3)}/index.html",
             ]
+            
+            boletin_encontrado = False
             
             for url in urls_probar:
                 try:
@@ -423,51 +501,59 @@ def buscar_boja_historico(fecha_inicio, fecha_fin, contenido_completo=False):
                     if response.status_code == 200:
                         soup = BeautifulSoup(response.text, 'html.parser')
                         
-                        # Buscar enlaces a disposiciones
-                        enlaces_encontrados = 0
-                        for enlace in soup.find_all('a', href=True):
-                            href = enlace['href']
-                            titulo = enlace.get_text(strip=True)
-                            
-                            # Filtrar enlaces relevantes (evitar navegación, etc.)
-                            if titulo and len(titulo) > 20 and not any(x in href.lower() for x in ['javascript', 'mailto', '#']):
-                                # Construir URL completa
-                                if href.startswith('/'):
-                                    href_completo = f"https://www.juntadeandalucia.es{href}"
-                                elif not href.startswith('http'):
-                                    base_url = url.rsplit('/', 1)[0]
-                                    href_completo = f"{base_url}/{href}"
-                                else:
-                                    href_completo = href
-                                
-                                # Verificar que no sea duplicado
-                                if not any(r['Enlace'] == href_completo for r in resultados):
-                                    texto_completo = ""
-                                    if contenido_completo:
-                                        texto_completo = extraer_contenido_completo(href_completo)
-                                    
-                                    resultados.append({
-                                        'Boletín': 'BOJA',
-                                        'Título': titulo,
-                                        'Resumen': f'BOJA núm. {num_prueba} del {fecha_actual.strftime("%d/%m/%Y")}',
-                                        'Contenido_Completo': texto_completo,
-                                        'Enlace': href_completo,
-                                        'Fecha': pd.to_datetime(fecha_actual)
-                                    })
-                                    enlaces_encontrados += 1
+                        # Verificar que sea del día correcto
+                        texto_pagina = soup.get_text()
+                        fecha_str = fecha_actual.strftime('%d/%m/%Y')
                         
-                        if enlaces_encontrados > 0:
-                            break  # Salir del loop de URLs si encontró resultados
+                        # Solo procesar si encuentra la fecha en la página
+                        if fecha_str in texto_pagina or str(num_boletin) in texto_pagina:
+                            # Buscar enlaces a disposiciones
+                            for enlace in soup.find_all('a', href=True):
+                                href = enlace['href']
+                                titulo = enlace.get_text(strip=True)
+                                
+                                # Filtrar enlaces relevantes
+                                if titulo and len(titulo) > 20:
+                                    # Evitar enlaces de navegación
+                                    if any(x in href.lower() for x in ['javascript', 'mailto', '#', '/temas/', '/organismos/']):
+                                        continue
+                                    
+                                    # Construir URL completa
+                                    if href.startswith('/'):
+                                        href_completo = f"https://www.juntadeandalucia.es{href}"
+                                    elif not href.startswith('http'):
+                                        base_url = url.rsplit('/', 1)[0]
+                                        href_completo = f"{base_url}/{href}"
+                                    else:
+                                        href_completo = href
+                                    
+                                    # Evitar duplicados
+                                    if not any(r['Enlace'] == href_completo for r in resultados):
+                                        texto_completo = ""
+                                        if contenido_completo:
+                                            texto_completo = extraer_contenido_completo(href_completo)
+                                        
+                                        resultados.append({
+                                            'Boletín': 'BOJA',
+                                            'Título': titulo,
+                                            'Resumen': f'BOJA núm. {num_boletin} del {fecha_actual.strftime("%d/%m/%Y")}',
+                                            'Contenido_Completo': texto_completo,
+                                            'Enlace': href_completo,
+                                            'Fecha': pd.to_datetime(fecha_actual)
+                                        })
+                            
+                            boletin_encontrado = True
+                            break  # Salir del loop de URLs
                     
                     time.sleep(0.2)
                     
                 except requests.exceptions.RequestException:
                     continue
-                except Exception as e:
+                except Exception:
                     continue
             
-            if enlaces_encontrados > 0:
-                break  # Salir del loop de offsets si encontró el boletín
+            if boletin_encontrado:
+                break  # Salir del loop de offsets
         
         fecha_actual += timedelta(days=1)
         dia_actual += 1
@@ -475,97 +561,111 @@ def buscar_boja_historico(fecha_inicio, fecha_fin, contenido_completo=False):
     progress_bar.empty()
     progress_text.empty()
     
-    # Si no encontró resultados, intentar método alternativo
-    if not resultados:
-        st.warning("⚠️ Método 1 no devolvió resultados. Probando método alternativo...")
-        resultados = buscar_boja_historico_alternativo(fecha_inicio, fecha_fin, contenido_completo)
-    
     return resultados
 
+# ============= FUNCIÓN DE VERIFICACIÓN DE CONSISTENCIA =============
 
-def buscar_boja_historico_alternativo(fecha_inicio, fecha_fin, contenido_completo=False):
-    """Método alternativo: busca usando el buscador oficial del BOJA"""
-    resultados = []
+def verificar_consistencia_busqueda():
+    """Verifica que la búsqueda histórica devuelve los mismos resultados que el feed RSS"""
     
-    st.info("🔍 Método 2: Usando búsqueda por año completo...")
+    st.subheader("🧪 Verificación de Consistencia")
+    st.write("Compara los resultados del Feed RSS vs Búsqueda Histórica para las mismas fechas")
     
-    progress_text = st.empty()
-    progress_bar = st.progress(0)
+    col1, col2 = st.columns(2)
     
-    años = list(range(fecha_inicio.year, fecha_fin.year + 1))
-    
-    for idx, año in enumerate(años):
-        progress_bar.progress(idx / len(años))
-        progress_text.text(f"Buscando en BOJA del año {año}...")
+    with col1:
+        st.write("**1️⃣ Resultados del Feed RSS (últimos 7 días)**")
         
-        # Intentar con la API de datos abiertos
-        url_api = f"https://www.juntadeandalucia.es/datosabiertos/portal/api/3/action/package_search"
-        
-        params = {
-            "q": f"boja {año}",
-            "rows": 500,
-            "start": 0
-        }
-        
-        try:
-            response = session.get(url_api, params=params, timeout=30)
+        with st.spinner("Obteniendo feed RSS..."):
+            resultados_rss = buscar_boja_feed(contenido_completo=False)
             
-            if response.status_code == 200:
-                data = response.json()
+            if resultados_rss:
+                df_rss = pd.DataFrame(resultados_rss)
                 
-                if data.get("success"):
-                    datasets = data.get("result", {}).get("results", [])
-                    
-                    for dataset in datasets:
-                        titulo = dataset.get("title", "")
-                        notas = dataset.get("notes", "")
-                        
-                        # Obtener recursos
-                        recursos = dataset.get("resources", [])
-                        
-                        for recurso in recursos:
-                            url_recurso = recurso.get("url", "")
-                            formato = recurso.get("format", "").upper()
-                            
-                            # Intentar extraer fecha
-                            fecha_pub = dataset.get("metadata_created", "")
-                            fecha_obj = None
-                            
-                            if fecha_pub:
-                                try:
-                                    fecha_obj = pd.to_datetime(fecha_pub)
-                                    
-                                    # Filtrar por rango
-                                    if fecha_obj < pd.to_datetime(fecha_inicio) or fecha_obj > pd.to_datetime(fecha_fin):
-                                        continue
-                                except:
-                                    pass
-                            
-                            if url_recurso and titulo:
-                                texto_completo = ""
-                                if contenido_completo and formato in ["HTML", "HTM"]:
-                                    texto_completo = extraer_contenido_completo(url_recurso)
-                                
-                                resultados.append({
-                                    'Boletín': 'BOJA',
-                                    'Título': titulo,
-                                    'Resumen': notas[:300],
-                                    'Contenido_Completo': texto_completo,
-                                    'Enlace': url_recurso,
-                                    'Fecha': fecha_obj if fecha_obj else pd.NaT
-                                })
-            
-            time.sleep(0.5)
-            
-        except Exception as e:
-            st.warning(f"Error en API de datos abiertos para {año}: {str(e)[:100]}")
-            continue
+                # Filtrar últimos 7 días
+                hace_7_dias = pd.to_datetime(datetime.now() - timedelta(days=7))
+                df_rss_filtrado = df_rss[df_rss['Fecha'] >= hace_7_dias]
+                
+                st.metric("Documentos encontrados", len(df_rss_filtrado))
+                
+                if len(df_rss_filtrado) > 0:
+                    st.dataframe(
+                        df_rss_filtrado[['Título', 'Fecha']].head(5),
+                        use_container_width=True
+                    )
+            else:
+                st.error("No se obtuvieron resultados del RSS")
     
-    progress_bar.empty()
-    progress_text.empty()
+    with col2:
+        st.write("**2️⃣ Resultados de Búsqueda Histórica (mismas fechas)**")
+        
+        with st.spinner("Obteniendo búsqueda histórica..."):
+            fecha_inicio = datetime.now() - timedelta(days=7)
+            fecha_fin = datetime.now()
+            
+            resultados_historico = buscar_boja_historico(
+                fecha_inicio,
+                fecha_fin,
+                contenido_completo=False
+            )
+            
+            if resultados_historico:
+                df_historico = pd.DataFrame(resultados_historico)
+                
+                st.metric("Documentos encontrados", len(df_historico))
+                
+                if len(df_historico) > 0:
+                    st.dataframe(
+                        df_historico[['Título', 'Fecha']].head(5),
+                        use_container_width=True
+                    )
+            else:
+                st.error("No se obtuvieron resultados del histórico")
     
-    return resultados
-
+    # Comparación
+    st.markdown("---")
+    st.write("### 📊 Comparación de Resultados")
+    
+    if resultados_rss and resultados_historico:
+        df_rss_filtrado = pd.DataFrame(resultados_rss)
+        hace_7_dias = pd.to_datetime(datetime.now() - timedelta(days=7))
+        df_rss_filtrado = df_rss_filtrado[df_rss_filtrado['Fecha'] >= hace_7_dias]
+        
+        df_historico = pd.DataFrame(resultados_historico)
+        
+        col_a, col_b, col_c = st.columns(3)
+        
+        with col_a:
+            st.metric("Feed RSS", len(df_rss_filtrado))
+        with col_b:
+            st.metric("Histórico", len(df_historico))
+        with col_c:
+            diferencia = abs(len(df_rss_filtrado) - len(df_historico))
+            st.metric("Diferencia", diferencia)
+        
+        if len(df_rss_filtrado) == len(df_historico):
+            st.success(f"✅ ¡Perfecto! Ambos métodos devuelven el mismo número de documentos: {len(df_rss_filtrado)}")
+        else:
+            st.warning(f"⚠️ Diferencia encontrada: RSS={len(df_rss_filtrado)}, Histórico={len(df_historico)}")
+            
+            # Mostrar documentos que están en uno pero no en el otro
+            enlaces_rss = set(df_rss_filtrado['Enlace'].tolist())
+            enlaces_historico = set(df_historico['Enlace'].tolist())
+            
+            solo_rss = enlaces_rss - enlaces_historico
+            solo_historico = enlaces_historico - enlaces_rss
+            
+            if solo_rss:
+                with st.expander(f"📄 Solo en RSS: {len(solo_rss)} documentos"):
+                    for enlace in list(solo_rss)[:5]:
+                        doc = df_rss_filtrado[df_rss_filtrado['Enlace'] == enlace].iloc[0]
+                        st.write(f"- {doc['Título'][:80]}...")
+            
+            if solo_historico:
+                with st.expander(f"📄 Solo en Histórico: {len(solo_historico)} documentos"):
+                    for enlace in list(solo_historico)[:5]:
+                        doc = df_historico[df_historico['Enlace'] == enlace].iloc[0]
+                        st.write(f"- {doc['Título'][:80]}...")
 
 # ============= FUNCIÓN DE DIAGNÓSTICO =============
 
@@ -769,6 +869,11 @@ with st.sidebar:
         st.markdown("---")
         diagnosticar_boja()
         st.markdown("---")
+        
+        if st.button("🧪 Verificar consistencia de búsqueda"):
+            verificar_consistencia_busqueda()
+        
+        st.markdown("---")
     
     # ============= CONFIGURACIÓN DE IA =============
     st.subheader("🤖 Inteligencia Artificial")
@@ -853,7 +958,7 @@ with st.sidebar:
     usar_boja_hist = st.checkbox(
         "BOJA (Histórico por fechas)", 
         value=False,
-        help="Busca en boletines anteriores"
+        help="Busca en boletines anteriores (usa el feed RSS filtrado por fechas)"
     )
     usar_boe_hist = st.checkbox(
         "BOE (Histórico - API oficial)", 
@@ -1089,7 +1194,7 @@ with st.expander("ℹ️ Ayuda y Guía de Uso"):
     
     #### 2. Seleccionar fuentes
     - **Feed del día**: Publicaciones más recientes (rápido)
-    - **Histórico**: Busca en fechas anteriores (más lento)
+    - **Histórico**: Busca en fechas anteriores usando el mismo feed RSS
     
     #### 3. Búsqueda inteligente con IA
     - Activa "Búsqueda inteligente con IA"
@@ -1110,8 +1215,15 @@ with st.expander("ℹ️ Ayuda y Guía de Uso"):
     #### 6. Modo diagnóstico
     - Activa "Modo diagnóstico" en el sidebar
     - Prueba diferentes endpoints del BOJA
+    - Verifica consistencia entre Feed RSS e Histórico
     - Identifica qué URLs funcionan y cuáles no
-    - Útil para solucionar problemas de conexión
+    
+    ### ✅ Mejoras en esta versión
+    
+    - **Búsqueda histórica mejorada**: Usa el feed RSS y filtra por fechas
+    - **Feed RSS e Histórico devuelven los mismos resultados** para fechas recientes
+    - **Filtrado de páginas institucionales**: Solo muestra documentos oficiales
+    - **Verificación de consistencia**: Compara ambos métodos
     
     ### 💰 Costos de OpenAI
     
@@ -1136,14 +1248,14 @@ with st.expander("ℹ️ Ayuda y Guía de Uso"):
     
     ### 🔧 Solución de problemas
     
-    Si la búsqueda histórica del BOJA no funciona:
+    Si la búsqueda histórica no devuelve los mismos resultados:
     1. Activa el "Modo diagnóstico"
-    2. Prueba con una fecha reciente (últimos 7 días)
-    3. Verifica qué endpoints responden correctamente
-    4. Si ninguno funciona, puede haber un problema temporal con los servidores del BOJA
+    2. Ejecuta "Verificar consistencia de búsqueda"
+    3. Compara los resultados de ambos métodos
+    4. El feed RSS tiene documentos de ~30 días hacia atrás
     """)
 
 # Footer
 st.markdown("---")
 st.markdown("🤖 **Desarrollado con Streamlit + OpenAI** | 📅 Actualizado: Octubre 2025")
-st.markdown("🔧 **Versión mejorada con diagnóstico** | Incluye múltiples métodos de búsqueda para BOJA")
+st.markdown("🔧 **Versión 2.0 mejorada** | Feed RSS e Histórico ahora devuelven los mismos resultados ✅")
