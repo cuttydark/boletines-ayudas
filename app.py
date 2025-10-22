@@ -23,7 +23,7 @@ def crear_session():
         total=3,
         backoff_factor=1,
         status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET"]
+        allowed_methods=["GET", "POST"]
     )
     adapter = HTTPAdapter(max_retries=retry_strategy)
     session.mount("http://", adapter)
@@ -377,28 +377,134 @@ def buscar_boe_historico_api(fecha_inicio, fecha_fin, contenido_completo=False):
     
     return resultados
 
+# ============= NUEVA FUNCIÓN MEJORADA PARA BOJA HISTÓRICO =============
+
 def buscar_boja_historico(fecha_inicio, fecha_fin, contenido_completo=False):
-    """Busca en BOJA histórico usando la API oficial de datos abiertos"""
+    """Busca en BOJA histórico usando múltiples métodos"""
     resultados = []
     
     progress_text = st.empty()
     progress_bar = st.progress(0)
     
-    años_a_procesar = list(range(fecha_inicio.year, fecha_fin.year + 1))
-    total_años = len(años_a_procesar)
-    año_idx = 0
+    fecha_actual = fecha_inicio
+    total_dias = (fecha_fin - fecha_actual).days + 1
+    dia_actual = 0
     
-    for año in años_a_procesar:
-        progress_text.text(f"Consultando BOJA del año {año} ({año_idx+1}/{total_años})")
-        progress_bar.progress(año_idx / total_años)
+    # Método 1: Intentar con el buscador oficial del e-BOJA
+    st.info("🔍 Método 1: Buscando en e-BOJA oficial...")
+    
+    while fecha_actual <= fecha_fin:
+        progress_bar.progress(dia_actual / total_dias)
+        progress_text.text(f"Consultando BOJA del {fecha_actual.strftime('%d/%m/%Y')} ({dia_actual+1}/{total_dias})")
         
-        # URL de la API oficial del BOJA
+        # URL del nuevo e-BOJA
+        año = fecha_actual.year
+        
+        # Calcular número de boletín aproximado (más preciso)
+        dia_año = fecha_actual.timetuple().tm_yday
+        # Los boletines se publican de lunes a viernes (aproximadamente 250 boletines/año)
+        num_boletin = int((dia_año / 365) * 250)
+        
+        # Probar varios números alrededor del estimado
+        for offset in range(-5, 6):
+            num_prueba = max(1, num_boletin + offset)
+            
+            # Formatos de URL a probar
+            urls_probar = [
+                f"https://www.juntadeandalucia.es/eboja/{año}/{str(num_prueba).zfill(3)}/",
+                f"https://www.juntadeandalucia.es/boja/{año}/{str(num_prueba).zfill(3)}/index.html",
+                f"https://www.juntadeandalucia.es/eboja/{año}/{str(num_prueba).zfill(3)}/index.html",
+            ]
+            
+            for url in urls_probar:
+                try:
+                    response = session.get(url, timeout=10)
+                    
+                    if response.status_code == 200:
+                        soup = BeautifulSoup(response.text, 'html.parser')
+                        
+                        # Buscar enlaces a disposiciones
+                        enlaces_encontrados = 0
+                        for enlace in soup.find_all('a', href=True):
+                            href = enlace['href']
+                            titulo = enlace.get_text(strip=True)
+                            
+                            # Filtrar enlaces relevantes (evitar navegación, etc.)
+                            if titulo and len(titulo) > 20 and not any(x in href.lower() for x in ['javascript', 'mailto', '#']):
+                                # Construir URL completa
+                                if href.startswith('/'):
+                                    href_completo = f"https://www.juntadeandalucia.es{href}"
+                                elif not href.startswith('http'):
+                                    base_url = url.rsplit('/', 1)[0]
+                                    href_completo = f"{base_url}/{href}"
+                                else:
+                                    href_completo = href
+                                
+                                # Verificar que no sea duplicado
+                                if not any(r['Enlace'] == href_completo for r in resultados):
+                                    texto_completo = ""
+                                    if contenido_completo:
+                                        texto_completo = extraer_contenido_completo(href_completo)
+                                    
+                                    resultados.append({
+                                        'Boletín': 'BOJA',
+                                        'Título': titulo,
+                                        'Resumen': f'BOJA núm. {num_prueba} del {fecha_actual.strftime("%d/%m/%Y")}',
+                                        'Contenido_Completo': texto_completo,
+                                        'Enlace': href_completo,
+                                        'Fecha': pd.to_datetime(fecha_actual)
+                                    })
+                                    enlaces_encontrados += 1
+                        
+                        if enlaces_encontrados > 0:
+                            break  # Salir del loop de URLs si encontró resultados
+                    
+                    time.sleep(0.2)
+                    
+                except requests.exceptions.RequestException:
+                    continue
+                except Exception as e:
+                    continue
+            
+            if enlaces_encontrados > 0:
+                break  # Salir del loop de offsets si encontró el boletín
+        
+        fecha_actual += timedelta(days=1)
+        dia_actual += 1
+    
+    progress_bar.empty()
+    progress_text.empty()
+    
+    # Si no encontró resultados, intentar método alternativo
+    if not resultados:
+        st.warning("⚠️ Método 1 no devolvió resultados. Probando método alternativo...")
+        resultados = buscar_boja_historico_alternativo(fecha_inicio, fecha_fin, contenido_completo)
+    
+    return resultados
+
+
+def buscar_boja_historico_alternativo(fecha_inicio, fecha_fin, contenido_completo=False):
+    """Método alternativo: busca usando el buscador oficial del BOJA"""
+    resultados = []
+    
+    st.info("🔍 Método 2: Usando búsqueda por año completo...")
+    
+    progress_text = st.empty()
+    progress_bar = st.progress(0)
+    
+    años = list(range(fecha_inicio.year, fecha_fin.year + 1))
+    
+    for idx, año in enumerate(años):
+        progress_bar.progress(idx / len(años))
+        progress_text.text(f"Buscando en BOJA del año {año}...")
+        
+        # Intentar con la API de datos abiertos
         url_api = f"https://www.juntadeandalucia.es/datosabiertos/portal/api/3/action/package_search"
         
-        # Parámetros para filtrar por año
         params = {
             "q": f"boja {año}",
-            "rows": 1000,  # Máximo de resultados
+            "rows": 500,
+            "start": 0
         }
         
         try:
@@ -411,18 +517,17 @@ def buscar_boja_historico(fecha_inicio, fecha_fin, contenido_completo=False):
                     datasets = data.get("result", {}).get("results", [])
                     
                     for dataset in datasets:
-                        # Extraer información del dataset
                         titulo = dataset.get("title", "")
                         notas = dataset.get("notes", "")
                         
-                        # Obtener recursos (PDFs, HTMLs, etc.)
+                        # Obtener recursos
                         recursos = dataset.get("resources", [])
                         
                         for recurso in recursos:
                             url_recurso = recurso.get("url", "")
                             formato = recurso.get("format", "").upper()
                             
-                            # Filtrar por fecha si está disponible
+                            # Intentar extraer fecha
                             fecha_pub = dataset.get("metadata_created", "")
                             fecha_obj = None
                             
@@ -430,129 +535,162 @@ def buscar_boja_historico(fecha_inicio, fecha_fin, contenido_completo=False):
                                 try:
                                     fecha_obj = pd.to_datetime(fecha_pub)
                                     
-                                    # Filtrar por rango de fechas
+                                    # Filtrar por rango
                                     if fecha_obj < pd.to_datetime(fecha_inicio) or fecha_obj > pd.to_datetime(fecha_fin):
                                         continue
                                 except:
                                     pass
                             
-                            # Extraer contenido completo si se solicita
-                            texto_completo = ""
-                            if contenido_completo and url_recurso and formato in ["HTML", "HTM"]:
-                                texto_completo = extraer_contenido_completo(url_recurso)
-                            
-                            resultados.append({
-                                'Boletín': 'BOJA',
-                                'Título': titulo,
-                                'Resumen': notas[:300],
-                                'Contenido_Completo': texto_completo,
-                                'Enlace': url_recurso,
-                                'Fecha': fecha_obj
-                            })
-            
-            time.sleep(0.5)
-            
-        except requests.exceptions.RequestException as e:
-            st.warning(f"Error al consultar BOJA API para año {año}: {str(e)[:100]}")
-        except Exception as e:
-            st.error(f"Error procesando BOJA del año {año}: {str(e)[:100]}")
-        
-        año_idx += 1
-    
-    progress_bar.empty()
-    progress_text.empty()
-    
-    # Si no hay resultados con la API, intentar método alternativo
-    if not resultados:
-        st.warning("⚠️ La API no devolvió resultados. Intentando método alternativo...")
-        resultados = buscar_boja_historico_alternativo(fecha_inicio, fecha_fin, contenido_completo)
-    
-    return resultados
-
-
-def buscar_boja_historico_alternativo(fecha_inicio, fecha_fin, contenido_completo=False):
-    """Método alternativo: busca en BOJA usando scraping directo con URLs mejoradas"""
-    resultados = []
-    fecha_actual = fecha_inicio
-    
-    progress_text = st.empty()
-    progress_bar = st.progress(0)
-    
-    total_dias = (fecha_fin - fecha_actual).days + 1
-    dia_actual = 0
-    
-    # Intentar diferentes patrones de URL
-    patrones_url = [
-        "https://www.juntadeandalucia.es/eboja/{}",  # Nuevo formato e-BOJA
-        "https://www.juntadeandalucia.es/boja/{}",    # Formato antiguo
-    ]
-    
-    while fecha_actual <= fecha_fin:
-        progreso = dia_actual / total_dias
-        progress_bar.progress(progreso)
-        progress_text.text(f"Buscando BOJA del {fecha_actual.strftime('%d/%m/%Y')} ({dia_actual+1}/{total_dias})")
-        
-        año = fecha_actual.year
-        fecha_str = fecha_actual.strftime("%Y-%m-%d")
-        
-        # Intentar diferentes formatos de fecha
-        formatos_fecha = [
-            fecha_actual.strftime("%Y/%m/%d"),
-            fecha_actual.strftime("%Y/%m/%d/index.html"),
-            fecha_actual.strftime("%Y/%Y%m%d"),
-        ]
-        
-        for patron_base in patrones_url:
-            for formato_fecha in formatos_fecha:
-                url_prueba = patron_base.format(formato_fecha)
-                
-                try:
-                    response = session.get(url_prueba, timeout=10)
-                    
-                    if response.status_code == 200:
-                        soup = BeautifulSoup(response.text, 'html.parser')
-                        
-                        # Buscar enlaces a disposiciones
-                        for enlace in soup.find_all('a', href=True):
-                            href = enlace['href']
-                            titulo = enlace.get_text(strip=True)
-                            
-                            # Filtrar enlaces relevantes
-                            if titulo and len(titulo) > 10:
-                                if href.startswith('/'):
-                                    href_completo = f"https://www.juntadeandalucia.es{href}"
-                                elif not href.startswith('http'):
-                                    href_completo = f"https://www.juntadeandalucia.es/{href}"
-                                else:
-                                    href_completo = href
-                                
+                            if url_recurso and titulo:
                                 texto_completo = ""
-                                if contenido_completo:
-                                    texto_completo = extraer_contenido_completo(href_completo)
+                                if contenido_completo and formato in ["HTML", "HTM"]:
+                                    texto_completo = extraer_contenido_completo(url_recurso)
                                 
                                 resultados.append({
                                     'Boletín': 'BOJA',
                                     'Título': titulo,
-                                    'Resumen': f'BOJA del {fecha_actual.strftime("%d/%m/%Y")}',
+                                    'Resumen': notas[:300],
                                     'Contenido_Completo': texto_completo,
-                                    'Enlace': href_completo,
-                                    'Fecha': pd.to_datetime(fecha_actual)
+                                    'Enlace': url_recurso,
+                                    'Fecha': fecha_obj if fecha_obj else pd.NaT
                                 })
-                        
-                        break  # Si encontró resultados, no probar más formatos
-                    
-                except requests.exceptions.RequestException:
-                    continue
-                
-                time.sleep(0.2)
-        
-        fecha_actual += timedelta(days=1)
-        dia_actual += 1
+            
+            time.sleep(0.5)
+            
+        except Exception as e:
+            st.warning(f"Error en API de datos abiertos para {año}: {str(e)[:100]}")
+            continue
     
     progress_bar.empty()
     progress_text.empty()
     
     return resultados
+
+
+# ============= FUNCIÓN DE DIAGNÓSTICO =============
+
+def diagnosticar_boja():
+    """Función de diagnóstico para detectar problemas de acceso al BOJA"""
+    st.subheader("🔧 Diagnóstico de Acceso al BOJA")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        fecha_prueba = st.date_input(
+            "Fecha para probar",
+            datetime.now() - timedelta(days=7),
+            max_value=datetime.now()
+        )
+    
+    with col2:
+        num_boletin = st.number_input(
+            "Número de boletín (opcional)",
+            min_value=1,
+            max_value=300,
+            value=100
+        )
+    
+    if st.button("🚀 Ejecutar diagnóstico", type="primary"):
+        st.markdown("---")
+        st.write("### Probando diferentes endpoints...")
+        
+        año = fecha_prueba.year
+        dia_año = fecha_prueba.timetuple().tm_yday
+        num_estimado = int((dia_año / 365) * 250)
+        
+        # Lista de URLs a probar
+        urls_prueba = [
+            ("Feed RSS BOJA", "https://www.juntadeandalucia.es/boja/distribucion/boja.xml"),
+            ("e-BOJA Año", f"https://www.juntadeandalucia.es/eboja/{año}/"),
+            ("BOJA Clásico", f"https://www.juntadeandalucia.es/boja/{año}/"),
+            ("e-BOJA Boletín específico", f"https://www.juntadeandalucia.es/eboja/{año}/{str(num_boletin).zfill(3)}/"),
+            ("BOJA Boletín estimado", f"https://www.juntadeandalucia.es/boja/{año}/{str(num_estimado).zfill(3)}/index.html"),
+            ("API Datos Abiertos", "https://www.juntadeandalucia.es/datosabiertos/portal/api/3/action/package_search?q=boja"),
+            ("Buscador e-BOJA", "https://www.juntadeandalucia.es/eboja/static/index.html"),
+        ]
+        
+        resultados_test = []
+        
+        for nombre, url in urls_prueba:
+            try:
+                with st.spinner(f"Probando: {nombre}..."):
+                    response = session.get(url, timeout=15)
+                    
+                    resultado = {
+                        "Endpoint": nombre,
+                        "URL": url,
+                        "Status": response.status_code,
+                        "Tamaño": f"{len(response.content)} bytes",
+                        "Estado": "✅ OK" if response.status_code == 200 else f"❌ Error {response.status_code}"
+                    }
+                    
+                    resultados_test.append(resultado)
+                    
+                    # Mostrar información adicional para endpoints exitosos
+                    if response.status_code == 200:
+                        with st.expander(f"✅ {nombre} - Ver detalles"):
+                            st.code(response.text[:1000], language="html")
+                            
+                            # Intentar parsear contenido
+                            soup = BeautifulSoup(response.text, 'html.parser')
+                            enlaces = soup.find_all('a', href=True)
+                            st.write(f"**Enlaces encontrados:** {len(enlaces)}")
+                            
+                            if len(enlaces) > 0:
+                                st.write("**Primeros 5 enlaces:**")
+                                for enlace in enlaces[:5]:
+                                    st.write(f"- {enlace.get_text(strip=True)[:100]} → {enlace['href'][:100]}")
+                    else:
+                        st.error(f"❌ {nombre} - Error {response.status_code}")
+                
+                time.sleep(0.5)
+                
+            except requests.exceptions.Timeout:
+                resultados_test.append({
+                    "Endpoint": nombre,
+                    "URL": url,
+                    "Status": "Timeout",
+                    "Tamaño": "N/A",
+                    "Estado": "⏱️ Timeout"
+                })
+                st.warning(f"⏱️ {nombre} - Timeout")
+            
+            except Exception as e:
+                resultados_test.append({
+                    "Endpoint": nombre,
+                    "URL": url,
+                    "Status": "Error",
+                    "Tamaño": "N/A",
+                    "Estado": f"🔴 Error: {str(e)[:50]}"
+                })
+                st.error(f"🔴 {nombre} - {str(e)[:100]}")
+        
+        # Mostrar tabla resumen
+        st.markdown("---")
+        st.write("### 📊 Resumen de Diagnóstico")
+        df_diagnostico = pd.DataFrame(resultados_test)
+        st.dataframe(df_diagnostico, use_container_width=True)
+        
+        # Recomendaciones
+        st.markdown("---")
+        st.write("### 💡 Recomendaciones")
+        
+        endpoints_ok = sum(1 for r in resultados_test if r["Status"] == 200)
+        
+        if endpoints_ok == 0:
+            st.error("❌ No se pudo acceder a ningún endpoint. Posibles causas:")
+            st.write("- Problema de conexión a internet")
+            st.write("- Firewall bloqueando el acceso")
+            st.write("- Los servidores del BOJA están temporalmente inaccesibles")
+        elif endpoints_ok < 3:
+            st.warning("⚠️ Acceso limitado. Algunas URLs funcionan, otras no.")
+            st.write("- Usa solo los feeds que funcionan (BOJA Feed RSS)")
+            st.write("- La búsqueda histórica puede no funcionar correctamente")
+        else:
+            st.success("✅ La mayoría de endpoints funcionan correctamente")
+            st.write("- El sistema debería funcionar sin problemas")
+            st.write("- Si la búsqueda histórica falla, puede ser por URLs antiguas")
+
 
 def filtrar_resultados(df, palabras_clave, solo_ayudas=True, busqueda_exacta=False):
     """Filtra los resultados con regex mejorado"""
@@ -623,6 +761,14 @@ st.markdown("**BOJA** (Junta de Andalucía) + **BOE** (Estado) - Con IA de OpenA
 # Sidebar
 with st.sidebar:
     st.header("⚙️ Configuración")
+    
+    # ============= MODO DIAGNÓSTICO (AL PRINCIPIO) =============
+    modo_diagnostico = st.checkbox("🔧 Modo diagnóstico", value=False)
+    
+    if modo_diagnostico:
+        st.markdown("---")
+        diagnosticar_boja()
+        st.markdown("---")
     
     # ============= CONFIGURACIÓN DE IA =============
     st.subheader("🤖 Inteligencia Artificial")
@@ -937,7 +1083,7 @@ with st.expander("ℹ️ Ayuda y Guía de Uso"):
     ### 🎯 Cómo usar esta aplicación
     
     #### 1. Configurar OpenAI (opcional pero recomendado)
-    - Obtén tu API Key en: https://platform.openai.com/api-keys
+    - Obtén tu API Key en: [https://platform.openai.com/api-keys](https://platform.openai.com/api-keys)
     - Pégala en el campo "API Key de OpenAI"
     - Esto activará resúmenes inteligentes y búsqueda en lenguaje natural
     
@@ -961,6 +1107,12 @@ with st.expander("ℹ️ Ayuda y Guía de Uso"):
     - Selecciona cuántas ayudas resumir (máx. 20)
     - La IA extraerá: tipo, beneficiarios, cuantía, plazo y resumen
     
+    #### 6. Modo diagnóstico
+    - Activa "Modo diagnóstico" en el sidebar
+    - Prueba diferentes endpoints del BOJA
+    - Identifica qué URLs funcionan y cuáles no
+    - Útil para solucionar problemas de conexión
+    
     ### 💰 Costos de OpenAI
     
     - **gpt-4o-mini**: ~$0.001 por resumen (recomendado)
@@ -978,12 +1130,20 @@ with st.expander("ℹ️ Ayuda y Guía de Uso"):
     
     ### 📊 Fuentes oficiales
     
-    - **BOJA**: https://www.juntadeandalucia.es/boja
-    - **BOE**: https://www.boe.es
-    - **API BOE**: https://www.boe.es/datosabiertos/
+    - **BOJA**: [https://www.juntadeandalucia.es/boja](https://www.juntadeandalucia.es/boja)
+    - **BOE**: [https://www.boe.es](https://www.boe.es)
+    - **API BOE**: [https://www.boe.es/datosabiertos/](https://www.boe.es/datosabiertos/)
+    
+    ### 🔧 Solución de problemas
+    
+    Si la búsqueda histórica del BOJA no funciona:
+    1. Activa el "Modo diagnóstico"
+    2. Prueba con una fecha reciente (últimos 7 días)
+    3. Verifica qué endpoints responden correctamente
+    4. Si ninguno funciona, puede haber un problema temporal con los servidores del BOJA
     """)
 
 # Footer
 st.markdown("---")
 st.markdown("🤖 **Desarrollado con Streamlit + OpenAI** | 📅 Actualizado: Octubre 2025")
-
+st.markdown("🔧 **Versión mejorada con diagnóstico** | Incluye múltiples métodos de búsqueda para BOJA")
