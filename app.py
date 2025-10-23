@@ -13,10 +13,10 @@ from openai import OpenAI
 
 st.set_page_config(page_title="Búsqueda Ayudas BOJA/BOE con IA", layout="wide", page_icon="🔍")
 
-# ============= CONFIGURACIÓN DE SESIÓN MEJORADA =============
+# ============= CONFIGURACIÓN =============
 
 def crear_session():
-    """Crea una sesión HTTP con retry automático y User-Agent completo"""
+    """Crea sesión HTTP"""
     session = requests.Session()
     
     retry_strategy = Retry(
@@ -30,10 +30,9 @@ def crear_session():
     session.mount("https://", adapter)
     
     session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
-        "Accept-Encoding": "gzip, deflate",
+        "Accept-Language": "es-ES,es;q=0.9",
         "Connection": "keep-alive",
     })
     
@@ -41,407 +40,213 @@ def crear_session():
 
 session = crear_session()
 
-# ============= FUNCIONES DE IA CON OPENAI =============
+# ============= EXTRACCIÓN DE INFORMACIÓN =============
 
-def resumir_con_openai(texto, api_key, modelo="gpt-4o-mini", max_palabras=150):
-    """Genera un resumen estructurado usando OpenAI API"""
+def extraer_informacion_documento(titulo, resumen, contenido, palabras_clave):
+    """Extrae información estructurada"""
+    
+    texto_completo = f"{titulo} {resumen} {contenido}".lower()
+    
+    info = {
+        'tipo_documento': '',
+        'organismo': '',
+        'cuantia': '',
+        'plazo_solicitud': '',
+        'beneficiarios': '',
+        'objeto': '',
+        'contexto_palabras': []
+    }
+    
+    # Tipo
+    if re.search(r'\b(resolución|resolucion)\b', texto_completo):
+        info['tipo_documento'] = 'Resolución'
+    elif re.search(r'\b(orden)\b', texto_completo):
+        info['tipo_documento'] = 'Orden'
+    elif re.search(r'\b(decreto)\b', texto_completo):
+        info['tipo_documento'] = 'Decreto'
+    elif re.search(r'\b(convocatoria)\b', texto_completo):
+        info['tipo_documento'] = 'Convocatoria'
+    
+    # Organismo
+    organismos = [
+        r'Consejería de [A-Za-záéíóúñÑ\s,]+',
+        r'Dirección General de [A-Za-záéíóúñÑ\s,]+',
+    ]
+    
+    for patron in organismos:
+        match = re.search(patron, texto_completo, re.IGNORECASE)
+        if match:
+            info['organismo'] = match.group(0).strip()
+            break
+    
+    # Cuantía
+    match = re.search(r'(\d{1,3}(?:\.\d{3})*(?:,\d{2})?)\s*euros?', texto_completo, re.IGNORECASE)
+    if match:
+        info['cuantia'] = match.group(0).strip()
+    
+    # Plazo
+    match = re.search(r'plazo\s+de\s+(?:presentación\s+de\s+)?solicitudes?[:\s]+([^.]{10,80})', texto_completo, re.IGNORECASE)
+    if match:
+        info['plazo_solicitud'] = match.group(0).strip()
+    
+    # Contexto palabras
+    for palabra in palabras_clave:
+        palabra_lower = palabra.lower().strip()
+        if palabra_lower in texto_completo:
+            idx = 0
+            count = 0
+            while count < 2:
+                idx = texto_completo.find(palabra_lower, idx)
+                if idx == -1:
+                    break
+                
+                inicio = max(0, idx - 150)
+                fin = min(len(contenido) if contenido else len(texto_completo), idx + len(palabra_lower) + 150)
+                
+                contexto = contenido[inicio:fin] if contenido else texto_completo[inicio:fin]
+                
+                info['contexto_palabras'].append({
+                    'palabra': palabra,
+                    'contexto': f"...{contexto}..."
+                })
+                
+                idx += len(palabra_lower)
+                count += 1
+    
+    return info
+
+# ============= IA =============
+
+def resumir_con_openai(texto, api_key, modelo="gpt-4o-mini"):
     try:
         client = OpenAI(api_key=api_key)
-        
         response = client.chat.completions.create(
             model=modelo,
             messages=[
-                {
-                    "role": "system",
-                    "content": """Eres un experto en analizar ayudas y subvenciones públicas españolas del BOE y BOJA. 
-Extrae información clave de forma estructurada y precisa en español."""
-                },
-                {
-                    "role": "user",
-                    "content": f"""Analiza este documento oficial y proporciona SOLO un JSON con esta estructura exacta:
-
-{{
-  "tipo": "tipo de documento (ej: Subvención, Convocatoria, Resolución, Bases reguladoras)",
-  "beneficiarios": "quién puede solicitarla (ej: PYMES, autónomos, entidades locales)",
-  "cuantia": "importe o porcentaje disponible",
-  "plazo": "fecha límite de solicitud o duración",
-  "resumen": "descripción breve en máximo {max_palabras} palabras"
-}}
-
-DOCUMENTO:
-{texto[:8000]}
-
-Responde SOLO con el JSON, sin texto adicional."""
-                }
+                {"role": "system", "content": "Eres experto en ayudas españolas."},
+                {"role": "user", "content": f"Resume:\n{texto[:8000]}"}
             ],
             temperature=0.2,
             max_tokens=600,
             response_format={"type": "json_object"}
         )
-        
-        resultado = json.loads(response.choices[0].message.content)
-        return resultado
-    
-    except Exception as e:
-        return {
-            "tipo": "Error al procesar",
-            "beneficiarios": "No disponible",
-            "cuantia": "No disponible",
-            "plazo": "No disponible",
-            "resumen": f"Error al generar resumen: {str(e)[:100]}",
-            "error": str(e)
-        }
+        return json.loads(response.choices[0].message.content)
+    except:
+        return {}
 
-def busqueda_inteligente_openai(consulta_usuario, api_key, modelo="gpt-4o-mini"):
-    """Convierte una consulta en lenguaje natural a palabras clave específicas"""
+def busqueda_inteligente_openai(consulta, api_key, modelo="gpt-4o-mini"):
     try:
         client = OpenAI(api_key=api_key)
-        
         response = client.chat.completions.create(
             model=modelo,
             messages=[
-                {
-                    "role": "system",
-                    "content": "Eres un experto en ayudas públicas españolas. Convierte consultas naturales en palabras clave para búsqueda en BOE/BOJA."
-                },
-                {
-                    "role": "user",
-                    "content": f"""Un usuario busca: "{consulta_usuario}"
-
-Extrae las palabras clave MÁS RELEVANTES para buscar en el BOE/BOJA.
-Responde SOLO con las palabras clave separadas por comas, sin explicaciones.
-
-Ejemplos:
-- "ayudas para abrir un restaurante" → "hostelería, restauración, pyme, emprendimiento"
-- "subvenciones turismo rural Andalucía" → "turismo rural, alojamiento, feder, andalucía"
-- "financiación startups tecnológicas" → "startup, innovación, tecnología, emprendimiento, I+D"
-
-Palabras clave:"""
-                }
+                {"role": "system", "content": "Convierte a palabras clave."},
+                {"role": "user", "content": f"Palabras clave: {consulta}"}
             ],
             temperature=0.3,
             max_tokens=100
         )
-        
-        palabras = response.choices[0].message.content.strip()
-        return palabras
-    
-    except Exception as e:
-        st.error(f"Error en búsqueda inteligente: {e}")
-        return consulta_usuario
+        return response.choices[0].message.content.strip()
+    except:
+        return consulta
 
-# ============= FUNCIONES DE BÚSQUEDA =============
+# ============= BÚSQUEDA =============
 
 def extraer_contenido_completo(url, max_intentos=2):
-    """Extrae el texto completo de una página con logging mejorado"""
     for intento in range(max_intentos):
         try:
             response = session.get(url, timeout=20)
             response.raise_for_status()
-            
             soup = BeautifulSoup(response.text, 'html.parser')
-            
-            for element in soup(["script", "style", "nav", "header", "footer", "iframe"]):
+            for element in soup(["script", "style", "nav", "header", "footer"]):
                 element.decompose()
-            
             contenido = soup.get_text(separator=' ', strip=True)
-            
-            # Log del tamaño del contenido extraído
-            if contenido:
-                # Retornar el contenido sin sleep para acelerar
-                return contenido
-            else:
-                return ""
-            
-        except requests.exceptions.Timeout:
+            return contenido if contenido else ""
+        except:
             if intento < max_intentos - 1:
                 time.sleep(0.5)
-        except requests.exceptions.HTTPError as e:
-            break
-        except requests.exceptions.RequestException as e:
-            if intento < max_intentos - 1:
-                time.sleep(0.5)
-        except Exception as e:
-            break
-    
     return ""
 
 def buscar_boja_feed(contenido_completo=False):
-    """Busca en el feed principal de BOJA con filtrado mejorado"""
     resultados = []
-    url = "https://www.juntadeandalucia.es/boja/distribucion/boja.xml"
-    
     try:
-        response = session.get(url, timeout=20)
-        response.raise_for_status()
-        
+        response = session.get("https://www.juntadeandalucia.es/boja/distribucion/boja.xml", timeout=20)
         feed = feedparser.parse(response.content)
         
         for entry in feed.entries:
             titulo = entry.get('title', '')
-            resumen = BeautifulSoup(entry.get('summary', ''), 'html.parser').get_text()
             enlace = entry.get('link', '')
             
-            urls_excluir = [
-                '/temas/',
-                '/organismos/',
-                '/servicios/',
-                'juntadeandalucia.es/temas',
-                'juntadeandalucia.es/organismos'
-            ]
-            
-            if any(excluir in enlace for excluir in urls_excluir):
+            if any(x in enlace for x in ['/temas/', '/organismos/']) or '/boja/' not in enlace:
                 continue
-            
-            if '/boja/' not in enlace and '/eboja/' not in enlace:
-                continue
-            
-            fecha_str = entry.get('published', entry.get('updated', ''))
-            fecha = pd.to_datetime(fecha_str, errors='coerce', utc=True)
-            if pd.notna(fecha):
-                fecha = fecha.tz_localize(None)
-            
-            texto_completo = ""
-            if contenido_completo and enlace:
-                texto_completo = extraer_contenido_completo(enlace)
             
             resultados.append({
                 'Boletín': 'BOJA',
                 'Título': titulo,
-                'Resumen': resumen[:300],
-                'Contenido_Completo': texto_completo,
+                'Resumen': BeautifulSoup(entry.get('summary', ''), 'html.parser').get_text()[:300],
+                'Contenido_Completo': extraer_contenido_completo(enlace) if contenido_completo else "",
                 'Enlace': enlace,
-                'Fecha': fecha
+                'Fecha': pd.to_datetime(entry.get('published', ''), errors='coerce', utc=True).tz_localize(None) if pd.notna(pd.to_datetime(entry.get('published', ''), errors='coerce', utc=True)) else pd.NaT
             })
-            
-    except requests.exceptions.RequestException as e:
-        st.error(f"Error al buscar en BOJA: {e}")
-    except Exception as e:
-        st.error(f"Error inesperado en BOJA: {e}")
-    
+    except:
+        pass
     return resultados
 
 def buscar_boe_rss(contenido_completo=False):
-    """Busca en el RSS del BOE"""
     resultados = []
-    url = "https://www.boe.es/rss/boe.php"
-    
     try:
-        response = session.get(url, timeout=20)
-        response.raise_for_status()
-        
+        response = session.get("https://www.boe.es/rss/boe.php", timeout=20)
         feed = feedparser.parse(response.content)
         
         for entry in feed.entries:
-            titulo = entry.get('title', '')
-            resumen = BeautifulSoup(entry.get('summary', ''), 'html.parser').get_text()
-            enlace = entry.get('link', '')
-            
-            fecha_str = entry.get('published', entry.get('updated', ''))
-            fecha = pd.to_datetime(fecha_str, errors='coerce', utc=True)
-            if pd.notna(fecha):
-                fecha = fecha.tz_localize(None)
-            
-            texto_completo = ""
-            if contenido_completo and enlace:
-                texto_completo = extraer_contenido_completo(enlace)
-            
             resultados.append({
                 'Boletín': 'BOE',
-                'Título': titulo,
-                'Resumen': resumen[:300],
-                'Contenido_Completo': texto_completo,
-                'Enlace': enlace,
-                'Fecha': fecha
+                'Título': entry.get('title', ''),
+                'Resumen': BeautifulSoup(entry.get('summary', ''), 'html.parser').get_text()[:300],
+                'Contenido_Completo': "",
+                'Enlace': entry.get('link', ''),
+                'Fecha': pd.to_datetime(entry.get('published', ''), errors='coerce', utc=True).tz_localize(None) if pd.notna(pd.to_datetime(entry.get('published', ''), errors='coerce', utc=True)) else pd.NaT
             })
-            
-    except requests.exceptions.RequestException as e:
-        st.error(f"Error al buscar en BOE RSS: {e}")
-    except Exception as e:
-        st.error(f"Error inesperado en BOE RSS: {e}")
-    
+    except:
+        pass
     return resultados
 
-def buscar_boe_historico_api(fecha_inicio, fecha_fin, contenido_completo=False):
-    """Busca en el BOE por rango de fechas usando la API oficial"""
-    resultados = []
-    fecha_actual = fecha_inicio
-    
-    progress_text = st.empty()
-    progress_bar = st.progress(0)
-    
-    total_dias = (fecha_fin - fecha_actual).days + 1
-    dia_actual = 0
-    
-    while fecha_actual <= fecha_fin:
-        progreso = dia_actual / total_dias
-        progress_bar.progress(progreso)
-        progress_text.text(f"Consultando BOE del {fecha_actual.strftime('%d/%m/%Y')} ({dia_actual+1}/{total_dias})")
-        
-        fecha_str = fecha_actual.strftime("%Y%m%d")
-        url = f"https://www.boe.es/datosabiertos/api/boe/sumario/{fecha_str}"
-        
-        try:
-            response = session.get(url, headers={"Accept": "application/json"}, timeout=20)
-            
-            if response.status_code == 200:
-                data = response.json()
-                
-                if data.get("status", {}).get("code") == "200":
-                    sumario = data.get("data", {}).get("sumario", {})
-                    
-                    for diario in sumario.get("diario", []):
-                        for seccion in diario.get("seccion", []):
-                            for departamento in seccion.get("departamento", []):
-                                for epigrafe in departamento.get("epigrafe", []):
-                                    items = epigrafe.get("item", [])
-                                    if isinstance(items, dict):
-                                        items = [items]
-                                    
-                                    for item in items:
-                                        titulo = item.get("titulo", "")
-                                        enlace = item.get("url_html", "")
-                                        
-                                        texto_completo = ""
-                                        if contenido_completo and enlace:
-                                            texto_completo = extraer_contenido_completo(enlace)
-                                        
-                                        resultados.append({
-                                            'Boletín': 'BOE',
-                                            'Título': titulo,
-                                            'Resumen': f"Sección: {seccion.get('nombre', '')} - {departamento.get('nombre', '')}",
-                                            'Contenido_Completo': texto_completo,
-                                            'Enlace': enlace,
-                                            'Fecha': pd.to_datetime(fecha_actual)
-                                        })
-                                
-                                items_directos = departamento.get("item", [])
-                                if isinstance(items_directos, dict):
-                                    items_directos = [items_directos]
-                                
-                                for item in items_directos:
-                                    titulo = item.get("titulo", "")
-                                    enlace = item.get("url_html", "")
-                                    
-                                    texto_completo = ""
-                                    if contenido_completo and enlace:
-                                        texto_completo = extraer_contenido_completo(enlace)
-                                    
-                                    resultados.append({
-                                        'Boletín': 'BOE',
-                                        'Título': titulo,
-                                        'Resumen': f"Sección: {seccion.get('nombre', '')} - {departamento.get('nombre', '')}",
-                                        'Contenido_Completo': texto_completo,
-                                        'Enlace': enlace,
-                                        'Fecha': pd.to_datetime(fecha_actual)
-                                    })
-            
-            elif response.status_code != 404:
-                st.warning(f"⚠️ Error {response.status_code} al consultar BOE del {fecha_actual.strftime('%d/%m/%Y')}")
-            
-            time.sleep(0.3)
-            
-        except requests.exceptions.RequestException as e:
-            st.warning(f"Error de conexión para fecha {fecha_actual.strftime('%d/%m/%Y')}: {str(e)[:100]}")
-        except Exception as e:
-            st.error(f"Error procesando BOE del {fecha_actual.strftime('%d/%m/%Y')}: {str(e)[:100]}")
-        
-        fecha_actual += timedelta(days=1)
-        dia_actual += 1
-    
-    progress_bar.empty()
-    progress_text.empty()
-    
-    return resultados
-
-# ============= FUNCIONES EXHAUSTIVAS PARA BOJA HISTÓRICO =============
+# ============= BOJA HISTÓRICO =============
 
 def extraer_secciones_boja(url_boletin):
-    """Extrae todas las URLs de secciones del menú lateral derecho"""
     secciones = []
-    
     try:
         response = session.get(url_boletin, timeout=15)
-        
         if response.status_code == 200:
             soup = BeautifulSoup(response.text, 'html.parser')
-            
             for enlace in soup.find_all('a', href=True):
                 href = enlace['href']
-                titulo = enlace.get_text(strip=True)
-                
                 if re.search(r'/s\d+', href):
-                    if href.startswith('/'):
-                        url_completa = f"https://www.juntadeandalucia.es{href}"
-                    elif href.startswith('http'):
-                        url_completa = href
-                    else:
-                        url_completa = f"https://www.juntadeandalucia.es{href}"
-                    
-                    secciones.append({
-                        'titulo': titulo,
-                        'url': url_completa
-                    })
-            
-            secciones_unicas = []
-            urls_vistas = set()
-            
-            for seccion in secciones:
-                if seccion['url'] not in urls_vistas:
-                    secciones_unicas.append(seccion)
-                    urls_vistas.add(seccion['url'])
-            
-            return secciones_unicas
-    
-    except Exception as e:
-        return []
-
+                    url = f"https://www.juntadeandalucia.es{href}" if href.startswith('/') else href
+                    secciones.append({'titulo': enlace.get_text(strip=True), 'url': url})
+            return list({s['url']: s for s in secciones}.values())
+    except:
+        pass
+    return []
 
 def extraer_documentos_de_seccion(url_seccion):
-    """Extrae todos los documentos de una sección"""
     documentos = []
-    
     try:
         response = session.get(url_seccion, timeout=15)
-        
         if response.status_code == 200:
             soup = BeautifulSoup(response.text, 'html.parser')
-            
             for enlace in soup.find_all('a', href=True):
                 href = enlace['href']
                 titulo = enlace.get_text(strip=True)
-                
-                if re.search(r'/\d+$', href) and '/s' not in href:
-                    if href.startswith('/'):
-                        url_completa = f"https://www.juntadeandalucia.es{href}"
-                    elif href.startswith('http'):
-                        url_completa = href
-                    else:
-                        url_completa = f"https://www.juntadeandalucia.es{href}"
-                    
-                    if titulo and len(titulo) > 10:
-                        documentos.append({
-                            'titulo': titulo,
-                            'url': url_completa
-                        })
-            
-            documentos_unicos = []
-            urls_vistas = set()
-            
-            for doc in documentos:
-                if doc['url'] not in urls_vistas:
-                    documentos_unicos.append(doc)
-                    urls_vistas.add(doc['url'])
-            
-            return documentos_unicos
-    
-    except Exception as e:
-        return []
-
+                if re.search(r'/\d+$', href) and '/s' not in href and len(titulo) > 10:
+                    url = f"https://www.juntadeandalucia.es{href}" if href.startswith('/') else href
+                    documentos.append({'titulo': titulo, 'url': url})
+            return list({d['url']: d for d in documentos}.values())
+    except:
+        pass
+    return []
 
 def buscar_en_boletin_completo(año, num_boletin, fecha_publicacion, contenido_completo=False, progress_container=None):
-    """Busca exhaustivamente en un boletín completo con logging detallado"""
-    
     resultados = []
     
     urls_boletin = [
@@ -449,148 +254,182 @@ def buscar_en_boletin_completo(año, num_boletin, fecha_publicacion, contenido_c
         f"https://www.juntadeandalucia.es/eboja/{año}/{str(num_boletin).zfill(3)}/",
     ]
     
-    url_boletin_valida = None
-    
+    url_valida = None
     for url in urls_boletin:
         try:
             response = session.get(url, timeout=10)
             if response.status_code == 200:
-                url_boletin_valida = url
+                url_valida = url
                 break
         except:
             continue
     
-    if not url_boletin_valida:
+    if not url_valida:
         return []
     
-    # Extraer secciones
-    secciones = extraer_secciones_boja(url_boletin_valida)
+    secciones = extraer_secciones_boja(url_valida)
     
     if len(secciones) > 0:
         for seccion in secciones:
             documentos = extraer_documentos_de_seccion(seccion['url'])
             
-            # CRUCIAL: Descargar contenido de cada documento
             for idx, doc in enumerate(documentos):
-                texto_completo = ""
+                if progress_container:
+                    progress_container.text(f"    📄 {idx+1}/{len(documentos)}: {doc['titulo'][:40]}...")
                 
-                # SIEMPRE descargar contenido si se solicita
-                if contenido_completo:
-                    if progress_container:
-                        progress_container.text(f"    📄 Descargando contenido: {doc['titulo'][:50]}... ({idx+1}/{len(documentos)})")
-                    
-                    texto_completo = extraer_contenido_completo(doc['url'])
-                    
-                    # Verificar que se descargó contenido
-                    if texto_completo:
-                        longitud = len(texto_completo)
-                        if progress_container:
-                            progress_container.text(f"    ✅ Contenido descargado: {longitud} caracteres")
-                    else:
-                        if progress_container:
-                            progress_container.text(f"    ⚠️ Sin contenido para: {doc['titulo'][:50]}")
+                texto = extraer_contenido_completo(doc['url']) if contenido_completo else ""
                 
                 resultados.append({
                     'Boletín': 'BOJA',
                     'Título': doc['titulo'],
-                    'Resumen': f"BOJA núm. {num_boletin} de {año} - Sección: {seccion['titulo']}",
-                    'Contenido_Completo': texto_completo,
+                    'Resumen': f"BOJA {num_boletin}/{año} - {seccion['titulo']}",
+                    'Contenido_Completo': texto,
                     'Enlace': doc['url'],
                     'Fecha': fecha_publicacion,
                     'Seccion': seccion['titulo'],
                     'Numero_Boletin': num_boletin,
-                    'Tiene_Contenido': len(texto_completo) > 0
+                    'Tiene_Contenido': len(texto) > 0
                 })
             
-            time.sleep(0.2)
-    
-    else:
-        # Fallback: documentos del índice principal
-        try:
-            response = session.get(url_boletin_valida, timeout=15)
-            soup = BeautifulSoup(response.text, 'html.parser')
-            
-            for enlace in soup.find_all('a', href=True):
-                href = enlace['href']
-                titulo = enlace.get_text(strip=True)
-                
-                if re.search(r'/\d+$', href) and titulo and len(titulo) > 10:
-                    if href.startswith('/'):
-                        href_completo = f"https://www.juntadeandalucia.es{href}"
-                    elif href.startswith('http'):
-                        href_completo = href
-                    else:
-                        href_completo = f"{url_boletin_valida.rstrip('/')}/{href}"
-                    
-                    texto_completo = ""
-                    if contenido_completo:
-                        texto_completo = extraer_contenido_completo(href_completo)
-                    
-                    resultados.append({
-                        'Boletín': 'BOJA',
-                        'Título': titulo,
-                        'Resumen': f'BOJA núm. {num_boletin} de {año}',
-                        'Contenido_Completo': texto_completo,
-                        'Enlace': href_completo,
-                        'Fecha': fecha_publicacion,
-                        'Seccion': 'Principal',
-                        'Numero_Boletin': num_boletin,
-                        'Tiene_Contenido': len(texto_completo) > 0
-                    })
-        
-        except Exception as e:
-            pass
+            time.sleep(0.1)
     
     return resultados
 
+def encontrar_boletin_por_fecha(año, fecha_buscar, contenido_completo=False, progress_detail=None):
+    """Busca el boletín de una fecha específica probando diferentes estrategias"""
+    
+    mes = fecha_buscar.month
+    dia = fecha_buscar.day
+    
+    # ESTRATEGIA 1: Estimación basada en días del año
+    dia_año = fecha_buscar.timetuple().tm_yday
+    dias_habiles = int(dia_año * (5/7))
+    num_estimado = int(dias_habiles * 0.85)
+    
+    if progress_detail:
+        progress_detail.text(f"    🎯 Estimación inicial: BOJA {num_estimado}")
+    
+    # ESTRATEGIA 2: Probar rango amplio alrededor del estimado
+    for offset in range(-50, 51):
+        num_boletin = max(1, min(250, num_estimado + offset))
+        
+        if offset % 10 == 0 and progress_detail:
+            progress_detail.text(f"    🔍 Probando BOJA {num_boletin}...")
+        
+        urls = [
+            f"https://www.juntadeandalucia.es/boja/{año}/{str(num_boletin).zfill(3)}/",
+            f"https://www.juntadeandalucia.es/eboja/{año}/{str(num_boletin).zfill(3)}/",
+        ]
+        
+        for url in urls:
+            try:
+                response = session.get(url, timeout=8)
+                
+                if response.status_code == 200:
+                    soup = BeautifulSoup(response.text, 'html.parser')
+                    texto = soup.get_text().lower()
+                    
+                    # Verificar fecha
+                    meses = ['enero','febrero','marzo','abril','mayo','junio','julio','agosto','septiembre','octubre','noviembre','diciembre']
+                    
+                    formatos_fecha = [
+                        fecha_buscar.strftime('%d/%m/%Y'),
+                        f"{dia} de {meses[mes-1]} de {año}",
+                        f"{dia}/{mes}/{año}",
+                    ]
+                    
+                    if any(f.lower() in texto for f in formatos_fecha):
+                        if progress_detail:
+                            progress_detail.text(f"    ✅ ¡ENCONTRADO! BOJA {num_boletin}")
+                        
+                        return buscar_en_boletin_completo(año, num_boletin, pd.to_datetime(fecha_buscar), contenido_completo, progress_detail)
+                
+                time.sleep(0.05)
+            except:
+                continue
+    
+    # ESTRATEGIA 3: Si no encontró nada, probar TODOS los boletines del mes
+    if progress_detail:
+        progress_detail.text(f"    ⚠️ No encontrado en rango. Probando TODO el mes {meses[mes-1]}...")
+    
+    # Rango de boletines para cada mes (aproximado)
+    rangos_mes = {
+        1: (1, 20), 2: (21, 40), 3: (41, 60), 4: (61, 80),
+        5: (81, 100), 6: (101, 120), 7: (121, 140), 8: (141, 160),
+        9: (161, 180), 10: (181, 200), 11: (201, 220), 12: (221, 240)
+    }
+    
+    inicio, fin = rangos_mes.get(mes, (1, 250))
+    
+    for num_boletin in range(inicio, fin + 1):
+        if num_boletin % 5 == 0 and progress_detail:
+            progress_detail.text(f"    🔍 Búsqueda exhaustiva: BOJA {num_boletin}...")
+        
+        urls = [
+            f"https://www.juntadeandalucia.es/boja/{año}/{str(num_boletin).zfill(3)}/",
+            f"https://www.juntadeandalucia.es/eboja/{año}/{str(num_boletin).zfill(3)}/",
+        ]
+        
+        for url in urls:
+            try:
+                response = session.get(url, timeout=8)
+                
+                if response.status_code == 200:
+                    soup = BeautifulSoup(response.text, 'html.parser')
+                    texto = soup.get_text().lower()
+                    
+                    meses = ['enero','febrero','marzo','abril','mayo','junio','julio','agosto','septiembre','octubre','noviembre','diciembre']
+                    
+                    formatos_fecha = [
+                        fecha_buscar.strftime('%d/%m/%Y'),
+                        f"{dia} de {meses[mes-1]} de {año}",
+                    ]
+                    
+                    if any(f.lower() in texto for f in formatos_fecha):
+                        if progress_detail:
+                            progress_detail.text(f"    ✅ ¡ENCONTRADO en búsqueda exhaustiva! BOJA {num_boletin}")
+                        
+                        return buscar_en_boletin_completo(año, num_boletin, pd.to_datetime(fecha_buscar), contenido_completo, progress_detail)
+                
+                time.sleep(0.05)
+            except:
+                continue
+    
+    return []
 
 def buscar_boja_historico(fecha_inicio, fecha_fin, contenido_completo=False):
-    """Busca en BOJA histórico con logging detallado"""
+    """Búsqueda histórica"""
     
     dias_antiguedad = (datetime.now() - fecha_fin).days
     
     if dias_antiguedad <= 30:
-        st.info("🔍 Fechas recientes. Usando feed RSS...")
+        st.info("🔍 Fechas recientes (feed RSS)")
         return buscar_boja_feed_filtrado_por_fechas(fecha_inicio, fecha_fin, contenido_completo)
     else:
         st.info(f"🔍 Búsqueda exhaustiva activada ({dias_antiguedad} días)")
         return buscar_boja_historico_exhaustivo(fecha_inicio, fecha_fin, contenido_completo)
 
-
 def buscar_boja_feed_filtrado_por_fechas(fecha_inicio, fecha_fin, contenido_completo=False):
-    """Usa feed RSS filtrado"""
-    
-    resultados_feed = buscar_boja_feed(contenido_completo=False)
-    
-    if not resultados_feed:
+    resultados = buscar_boja_feed(contenido_completo=False)
+    if not resultados:
         return []
     
-    df_feed = pd.DataFrame(resultados_feed)
+    df = pd.DataFrame(resultados)
+    if 'Fecha' in df.columns:
+        mascara = (df['Fecha'] >= pd.to_datetime(fecha_inicio)) & (df['Fecha'] <= pd.to_datetime(fecha_fin))
+        df = df[mascara]
     
-    fecha_inicio_pd = pd.to_datetime(fecha_inicio)
-    fecha_fin_pd = pd.to_datetime(fecha_fin)
+    resultados = df.to_dict('records')
     
-    if 'Fecha' in df_feed.columns:
-        mascara_fechas = (df_feed['Fecha'] >= fecha_inicio_pd) & (df_feed['Fecha'] <= fecha_fin_pd)
-        df_filtrado = df_feed[mascara_fechas]
-    else:
-        df_filtrado = df_feed
-    
-    st.info(f"📊 {len(df_filtrado)} documentos del BOJA")
-    
-    resultados = df_filtrado.to_dict('records')
-    
-    if contenido_completo and len(resultados) > 0:
-        for resultado in resultados:
-            if resultado['Enlace']:
-                resultado['Contenido_Completo'] = extraer_contenido_completo(resultado['Enlace'])
-            time.sleep(0.3)
+    if contenido_completo:
+        for r in resultados:
+            if r['Enlace']:
+                r['Contenido_Completo'] = extraer_contenido_completo(r['Enlace'])
     
     return resultados
 
-
 def buscar_boja_historico_exhaustivo(fecha_inicio, fecha_fin, contenido_completo=False):
-    """Búsqueda exhaustiva con descarga de contenido garantizada"""
+    """Búsqueda exhaustiva mejorada"""
     
     resultados = []
     fecha_actual = fecha_inicio
@@ -602,267 +441,84 @@ def buscar_boja_historico_exhaustivo(fecha_inicio, fecha_fin, contenido_completo
     total_dias = (fecha_fin - fecha_actual).days + 1
     dia_actual = 0
     
-    st.info("🔄 Búsqueda exhaustiva: cada fecha, cada sección, cada documento...")
+    st.info("🔄 Búsqueda exhaustiva fecha por fecha...")
     
-    # Advertencia sobre descarga de contenido
     if contenido_completo:
-        st.warning("⚠️ DESCARGA DE CONTENIDO ACTIVADA - Esto tardará más tiempo pero buscará en el contenido completo")
-    else:
-        st.info("ℹ️ Solo buscando en títulos y resúmenes. Activa 'Buscar en contenido completo' para buscar dentro de los documentos")
+        st.warning("⚠️ DESCARGA DE CONTENIDO ACTIVADA")
     
     while fecha_actual <= fecha_fin:
         progress_bar.progress(dia_actual / total_dias)
         progress_text.text(f"📅 {fecha_actual.strftime('%d/%m/%Y')} ({dia_actual+1}/{total_dias})")
         
         año = fecha_actual.year
-        mes = fecha_actual.month
-        dia = fecha_actual.day
         
-        boletines_por_mes = {
-            1: 0, 2: 20, 3: 40, 4: 60, 5: 80, 6: 100,
-            7: 120, 8: 140, 9: 160, 10: 180, 11: 200, 12: 220
-        }
+        # Usar la nueva función mejorada
+        docs_encontrados = encontrar_boletin_por_fecha(año, fecha_actual, contenido_completo, progress_detail)
         
-        num_base = boletines_por_mes.get(mes, 0)
-        num_dia = int((dia / 30) * 22)
-        num_boletin_estimado = num_base + num_dia
-        
-        encontrado = False
-        
-        for offset in range(-20, 21):
-            num_boletin = max(1, min(250, num_boletin_estimado + offset))
+        if docs_encontrados:
+            con_contenido = sum(1 for d in docs_encontrados if d.get('Tiene_Contenido', False))
+            resultados.extend(docs_encontrados)
             
-            urls_boletin = [
-                f"https://www.juntadeandalucia.es/boja/{año}/{str(num_boletin).zfill(3)}/",
-                f"https://www.juntadeandalucia.es/eboja/{año}/{str(num_boletin).zfill(3)}/",
-            ]
-            
-            for url_boletin in urls_boletin:
-                try:
-                    response = session.get(url_boletin, timeout=10)
-                    
-                    if response.status_code == 200:
-                        soup = BeautifulSoup(response.text, 'html.parser')
-                        texto_pagina = soup.get_text().lower()
-                        
-                        fecha_formatos = [
-                            fecha_actual.strftime('%d/%m/%Y'),
-                            fecha_actual.strftime('%d-%m-%Y'),
-                            f"{dia} de {['enero','febrero','marzo','abril','mayo','junio','julio','agosto','septiembre','octubre','noviembre','diciembre'][mes-1]} de {año}".lower()
-                        ]
-                        
-                        pagina_correcta = any(fecha in texto_pagina for fecha in fecha_formatos)
-                        
-                        if pagina_correcta:
-                            progress_text.text(f"📅 {fecha_actual.strftime('%d/%m/%Y')} - ✅ BOJA {num_boletin}")
-                            progress_detail.text(f"    🔍 Extrayendo documentos y descargando contenido...")
-                            
-                            docs_boletin = buscar_en_boletin_completo(
-                                año, 
-                                num_boletin,
-                                pd.to_datetime(fecha_actual),
-                                contenido_completo,
-                                progress_detail
-                            )
-                            
-                            if docs_boletin:
-                                # Contar cuántos tienen contenido
-                                con_contenido = sum(1 for d in docs_boletin if d.get('Tiene_Contenido', False))
-                                
-                                resultados.extend(docs_boletin)
-                                
-                                if contenido_completo:
-                                    st.success(f"✅ {fecha_actual.strftime('%d/%m/%Y')}: {len(docs_boletin)} docs extraídos ({con_contenido} con contenido descargado)")
-                                else:
-                                    st.success(f"✅ {fecha_actual.strftime('%d/%m/%Y')}: {len(docs_boletin)} docs extraídos (sin descargar contenido)")
-                                
-                                encontrado = True
-                                break
-                
-                except:
-                    continue
-            
-            if encontrado:
-                break
-        
-        if not encontrado:
-            st.warning(f"⚠️ {fecha_actual.strftime('%d/%m/%Y')}: No se encontró boletín")
+            if contenido_completo:
+                st.success(f"✅ {fecha_actual.strftime('%d/%m/%Y')}: {len(docs_encontrados)} docs ({con_contenido} con contenido)")
+            else:
+                st.success(f"✅ {fecha_actual.strftime('%d/%m/%Y')}: {len(docs_encontrados)} docs")
+        else:
+            st.warning(f"⚠️ {fecha_actual.strftime('%d/%m/%Y')}: No se encontró boletín para esta fecha")
         
         fecha_actual += timedelta(days=1)
         dia_actual += 1
-        time.sleep(0.2)
+        time.sleep(0.1)
     
     progress_bar.empty()
     progress_text.empty()
     progress_detail.empty()
     
-    # Estadísticas finales
     if resultados:
         con_contenido = sum(1 for d in resultados if d.get('Tiene_Contenido', False))
-        st.success(f"✅ Búsqueda completada: {len(resultados)} documentos ({con_contenido} con contenido completo descargado)")
+        st.success(f"✅ Búsqueda completada: {len(resultados)} documentos ({con_contenido} con contenido)")
     else:
-        st.warning("⚠️ No se encontraron documentos en el rango de fechas")
+        st.error("❌ No se encontraron documentos en el rango de fechas especificado")
     
     return resultados
 
-# ============= FUNCIONES DE DIAGNÓSTICO =============
-
-def probar_boja_especifico():
-    """Prueba exhaustiva"""
-    
-    st.subheader("🧪 Prueba Exhaustiva")
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        año_prueba = st.number_input("Año:", min_value=2000, max_value=2025, value=2022)
-    
-    with col2:
-        num_boletin_prueba = st.number_input("Boletín:", min_value=1, max_value=250, value=82)
-    
-    palabra_buscar = st.text_input("Palabra:", "FEDER")
-    
-    if st.button("🔍 Buscar exhaustivamente", type="primary"):
-        with st.spinner(f"Buscando en BOJA {num_boletin_prueba}/{año_prueba}..."):
-            
-            progress_detail = st.empty()
-            
-            resultados = buscar_en_boletin_completo(
-                año_prueba, 
-                num_boletin_prueba,
-                pd.to_datetime(datetime.now()),
-                contenido_completo=True,
-                progress_container=progress_detail
-            )
-            
-            progress_detail.empty()
-            
-            if resultados:
-                st.success(f"✅ {len(resultados)} documentos")
-                
-                df_temp = pd.DataFrame(resultados)
-                if 'Seccion' in df_temp.columns:
-                    st.write("**📂 Por sección:**")
-                    for seccion, count in df_temp['Seccion'].value_counts().items():
-                        st.write(f"- {seccion}: {count}")
-                
-                st.markdown("---")
-                
-                docs_con_palabra = []
-                
-                for doc in resultados:
-                    texto_busqueda = f"{doc['Título']} {doc['Resumen']} {doc.get('Contenido_Completo', '')}".lower()
-                    
-                    if palabra_buscar.lower() in texto_busqueda:
-                        num_apariciones = texto_busqueda.count(palabra_buscar.lower())
-                        docs_con_palabra.append({
-                            **doc,
-                            'apariciones': num_apariciones
-                        })
-                
-                st.success(f"🎯 Docs con '{palabra_buscar}': **{len(docs_con_palabra)}**")
-                
-                if len(docs_con_palabra) > 0:
-                    for doc in docs_con_palabra:
-                        with st.expander(f"📄 {doc['Título'][:80]} ({doc['apariciones']} veces)"):
-                            st.write(f"**Sección:** {doc.get('Seccion')}")
-                            st.markdown(f"[🔗 Ver]({doc['Enlace']})")
-                            
-                            contenido = doc.get('Contenido_Completo', '')
-                            if contenido:
-                                idx_palabra = contenido.lower().find(palabra_buscar.lower())
-                                if idx_palabra != -1:
-                                    extracto = contenido[max(0, idx_palabra-200):min(len(contenido), idx_palabra+200)]
-                                    st.info(f"...{extracto}...")
-
-
-def diagnosticar_boja():
-    """Diagnóstico"""
-    st.subheader("🔧 Diagnóstico")
-    
-    fecha_prueba = st.date_input("Fecha:", datetime.now() - timedelta(days=7))
-    
-    if st.button("🚀 Ejecutar"):
-        urls_prueba = [
-            ("Feed RSS", "https://www.juntadeandalucia.es/boja/distribucion/boja.xml"),
-            ("BOJA 2022/82", "https://www.juntadeandalucia.es/boja/2022/82/"),
-        ]
-        
-        for nombre, url in urls_prueba:
-            try:
-                response = session.get(url, timeout=10)
-                st.write(f"**{nombre}**: {response.status_code}")
-                if response.status_code == 200:
-                    st.success("✅ OK")
-            except Exception as e:
-                st.error(f"❌ {str(e)[:100]}")
-
+# ============= FILTRADO =============
 
 def filtrar_resultados(df, palabras_clave, solo_ayudas=True, busqueda_exacta=False):
-    """Filtra con logging mejorado"""
     if df.empty:
         return df
     
     if 'Contenido_Completo' in df.columns:
-        df['_texto_busqueda'] = (
-            df['Título'].fillna('').astype(str) + ' ' + 
-            df['Resumen'].fillna('').astype(str) + ' ' +
-            df['Contenido_Completo'].fillna('').astype(str)
-        )
+        df['_texto'] = df['Título'].fillna('').astype(str) + ' ' + df['Resumen'].fillna('').astype(str) + ' ' + df['Contenido_Completo'].fillna('').astype(str)
     else:
-        df['_texto_busqueda'] = (
-            df['Título'].fillna('').astype(str) + ' ' + 
-            df['Resumen'].fillna('').astype(str)
-        )
+        df['_texto'] = df['Título'].fillna('').astype(str) + ' ' + df['Resumen'].fillna('').astype(str)
     
-    # Log: mostrar cuántos tienen contenido
     if 'Tiene_Contenido' in df.columns:
-        con_contenido = df['Tiene_Contenido'].sum()
-        st.info(f"📊 De {len(df)} documentos, {con_contenido} tienen contenido completo descargado")
+        st.info(f"📊 {len(df)} docs, {df['Tiene_Contenido'].sum()} con contenido")
     
     if solo_ayudas:
-        patron_ayudas = r'\b(ayuda|ayudas|subvención|subvencion|subvenciones|convocatoria|convocatorias|bases\s+reguladoras)\b'
-        mascara_ayudas = df['_texto_busqueda'].str.contains(
-            patron_ayudas, 
-            case=False, 
-            regex=True, 
-            na=False
-        )
-        df = df[mascara_ayudas]
-        st.info(f"📊 Después de filtrar 'ayudas/subvenciones': {len(df)} documentos")
+        patron = r'\b(ayuda|ayudas|subvención|subvencion|subvenciones|convocatoria|convocatorias)\b'
+        df = df[df['_texto'].str.contains(patron, case=False, regex=True, na=False)]
+        st.info(f"📊 Filtro ayudas: {len(df)} docs")
     
     if palabras_clave:
-        mascara_final = pd.Series([False] * len(df), index=df.index)
+        mascara = pd.Series([False] * len(df), index=df.index)
         
         for palabra in palabras_clave:
             palabra = palabra.strip()
             if palabra:
                 if busqueda_exacta:
-                    palabra_escaped = re.escape(palabra)
-                    patron = r'\b' + palabra_escaped + r'\b'
-                    mascara_palabra = df['_texto_busqueda'].str.contains(
-                        patron, 
-                        case=False, 
-                        regex=True, 
-                        na=False
-                    )
+                    patron = r'\b' + re.escape(palabra) + r'\b'
+                    m = df['_texto'].str.contains(patron, case=False, regex=True, na=False)
                 else:
-                    mascara_palabra = df['_texto_busqueda'].str.contains(
-                        palabra, 
-                        case=False, 
-                        regex=False, 
-                        na=False
-                    )
+                    m = df['_texto'].str.contains(palabra, case=False, regex=False, na=False)
                 
-                mascara_final = mascara_final | mascara_palabra
-                
-                encontrados = mascara_palabra.sum()
-                st.info(f"🔍 Palabra '{palabra}': encontrada en {encontrados} documentos")
+                mascara = mascara | m
+                st.info(f"🔍 '{palabra}': {m.sum()} docs")
         
-        df = df[mascara_final]
+        df = df[mascara]
     
-    df = df.drop(columns=['_texto_busqueda'])
-    
+    df = df.drop(columns=['_texto'])
     if 'Contenido_Completo' in df.columns:
         df = df.drop(columns=['Contenido_Completo'])
     
@@ -870,192 +526,138 @@ def filtrar_resultados(df, palabras_clave, solo_ayudas=True, busqueda_exacta=Fal
 
 # ============= INTERFAZ =============
 
-st.title("🔍 Buscador Inteligente de Ayudas y Subvenciones")
-st.markdown("**BOJA** (Junta de Andalucía) + **BOE** (Estado)")
+st.title("🔍 Buscador de Ayudas y Subvenciones")
+st.markdown("**BOJA + BOE** - Búsqueda exhaustiva mejorada")
 
-# Sidebar
 with st.sidebar:
-    st.header("⚙️ Configuración")
-    
-    modo_diagnostico = st.checkbox("🔧 Modo diagnóstico", value=False)
-    
-    if modo_diagnostico:
-        st.markdown("---")
-        diagnosticar_boja()
-        st.markdown("---")
-        probar_boja_especifico()
-        st.markdown("---")
+    st.header("⚙️ Config")
     
     st.subheader("🤖 IA")
-    
-    usar_ia = st.checkbox("Activar resúmenes con IA", value=False)
+    usar_ia = st.checkbox("Resúmenes IA", value=False)
     
     api_key_openai = None
-    modelo_openai = None
-    
     if usar_ia:
-        api_key_default = ""
         try:
-            api_key_default = st.secrets.get("openai", {}).get("api_key", "")
+            api_key_openai = st.secrets.get("openai", {}).get("api_key", "")
         except:
             pass
-        
-        if api_key_default:
-            api_key_openai = api_key_default
-            st.success("✅ API Key cargada")
-        else:
-            api_key_openai = st.text_input("🔑 API Key:", type="password")
-        
-        if api_key_openai:
-            modelo_openai = st.selectbox("Modelo:", ["gpt-4o-mini", "gpt-4o", "gpt-3.5-turbo"])
-    
-    st.markdown("---")
-    busqueda_inteligente = st.checkbox("🔮 Búsqueda inteligente", value=False)
-    
-    palabras_clave = ""
-    
-    if busqueda_inteligente and api_key_openai:
-        consulta_natural = st.text_area("Describe:", placeholder="Ej: ayudas turismo", height=100)
-        
-        if st.button("🔮 Generar"):
-            if consulta_natural:
-                palabras_generadas = busqueda_inteligente_openai(consulta_natural, api_key_openai, modelo_openai or "gpt-4o-mini")
-                st.success(f"✅ **{palabras_generadas}**")
-                palabras_clave = palabras_generadas
+        if not api_key_openai:
+            api_key_openai = st.text_input("API Key:", type="password")
     
     st.markdown("---")
     st.subheader("📰 Fuentes")
     
     usar_boja = st.checkbox("BOJA (Feed)", value=True)
-    usar_boe = st.checkbox("BOE (RSS)", value=True)
-    
-    st.markdown("**📅 Histórico**")
-    usar_boja_hist = st.checkbox("BOJA (Exhaustivo)", value=False)
-    usar_boe_hist = st.checkbox("BOE (API)", value=False)
+    usar_boe = st.checkbox("BOE (RSS)", value=False)
+    usar_boja_hist = st.checkbox("BOJA (Histórico)", value=False)
     
     fecha_desde = None
     fecha_hasta = None
     
-    if usar_boja_hist or usar_boe_hist:
+    if usar_boja_hist:
         col1, col2 = st.columns(2)
-        
-        fecha_desde = col1.date_input("Desde", datetime.now() - timedelta(days=7))
-        fecha_hasta = col2.date_input("Hasta", datetime.now())
-        
-        if fecha_desde > fecha_hasta:
-            st.error("⚠️ Fecha incorrecta")
+        fecha_desde = col1.date_input("Desde", datetime(2025, 3, 3))
+        fecha_hasta = col2.date_input("Hasta", datetime(2025, 3, 3))
     
     st.markdown("---")
     st.subheader("🔍 Opciones")
-    
-    contenido_completo = st.checkbox(
-        "🔥 Buscar en contenido completo",
-        value=False,
-        help="ACTIVAR para buscar dentro de los documentos"
-    )
-    
-    if contenido_completo:
-        st.warning("⏱️ Descargará el contenido de cada documento")
-    else:
-        st.info("ℹ️ Solo buscará en títulos/resúmenes")
+    contenido_completo = st.checkbox("🔥 Contenido completo", value=False)
     
     st.markdown("---")
     st.subheader("🎯 Filtros")
-    solo_ayudas = st.checkbox("Solo ayudas/subvenciones", value=True)
-    
-    if not busqueda_inteligente:
-        palabras_clave = st.text_input("Palabras clave:", "", help="Ej: feder, turismo")
-    
+    solo_ayudas = st.checkbox("Solo ayudas", value=True)
+    palabras_clave = st.text_input("Palabras clave:", "")
     busqueda_exacta = st.checkbox("Búsqueda exacta", value=True)
 
-# Búsqueda
 if st.button("🚀 Buscar", type="primary"):
-    if (usar_boja_hist or usar_boe_hist) and fecha_desde and fecha_hasta and fecha_desde > fecha_hasta:
-        st.error("❌ Corrige fechas")
-    else:
-        todos_resultados = []
-        
-        if usar_boja:
-            with st.status("🔎 BOJA..."):
-                todos_resultados.extend(buscar_boja_feed(contenido_completo))
-        
-        if usar_boe:
-            with st.status("🔎 BOE..."):
-                todos_resultados.extend(buscar_boe_rss(contenido_completo))
-        
-        if usar_boja_hist and fecha_desde and fecha_hasta:
-            todos_resultados.extend(
-                buscar_boja_historico(
-                    datetime.combine(fecha_desde, datetime.min.time()),
-                    datetime.combine(fecha_hasta, datetime.min.time()),
-                    contenido_completo
-                )
+    todos_resultados = []
+    
+    if usar_boja:
+        todos_resultados.extend(buscar_boja_feed(contenido_completo))
+    
+    if usar_boe:
+        todos_resultados.extend(buscar_boe_rss(contenido_completo))
+    
+    if usar_boja_hist and fecha_desde and fecha_hasta:
+        todos_resultados.extend(
+            buscar_boja_historico(
+                datetime.combine(fecha_desde, datetime.min.time()),
+                datetime.combine(fecha_hasta, datetime.min.time()),
+                contenido_completo
             )
+        )
+    
+    if todos_resultados:
+        df = pd.DataFrame(todos_resultados)
+        df = df.drop_duplicates(subset=['Enlace'], keep='first')
         
-        if usar_boe_hist and fecha_desde and fecha_hasta:
-            todos_resultados.extend(
-                buscar_boe_historico_api(
-                    datetime.combine(fecha_desde, datetime.min.time()),
-                    datetime.combine(fecha_hasta, datetime.min.time()),
-                    contenido_completo
-                )
-            )
+        st.info(f"📊 Total: {len(df)} docs")
         
-        if todos_resultados:
-            df = pd.DataFrame(todos_resultados)
-            df = df.drop_duplicates(subset=['Enlace'], keep='first')
+        lista_palabras = [p.strip() for p in palabras_clave.split(',') if p.strip()]
+        
+        df_filtrado = filtrar_resultados(df, lista_palabras, solo_ayudas, busqueda_exacta)
+        df_filtrado = df_filtrado.sort_values('Fecha', ascending=False, na_position='last')
+        
+        if len(df_filtrado) > 0:
+            st.success(f"✅ **{len(df_filtrado)} resultados**")
             
-            st.info(f"📊 Total de documentos extraídos: {len(df)}")
+            col1, col2 = st.columns(2)
+            col1.metric("BOJA", len(df_filtrado[df_filtrado['Boletín'] == 'BOJA']))
+            col2.metric("BOE", len(df_filtrado[df_filtrado['Boletín'] == 'BOE']))
             
-            lista_palabras = [p.strip() for p in palabras_clave.split(',') if p.strip()]
+            st.markdown("---")
+            st.subheader("📋 Información Extraída")
             
-            if lista_palabras:
-                st.info(f"🔍 Filtrando por: {', '.join(lista_palabras)}")
+            docs_procesados = []
+            for _, row in df_filtrado.iterrows():
+                info = extraer_informacion_documento(row['Título'], row['Resumen'], row.get('Contenido_Completo', ''), lista_palabras)
+                docs_procesados.append({**row.to_dict(), **info})
             
-            df_filtrado = filtrar_resultados(df, lista_palabras, solo_ayudas, busqueda_exacta)
-            df_filtrado = df_filtrado.sort_values('Fecha', ascending=False, na_position='last')
+            for idx, doc in enumerate(docs_procesados):
+                with st.expander(f"📄 {doc['Título'][:80]}...", expanded=(idx == 0)):
+                    col1, col2 = st.columns([2, 1])
+                    
+                    with col1:
+                        if doc['tipo_documento']:
+                            st.markdown(f"**Tipo:** {doc['tipo_documento']}")
+                        if doc['organismo']:
+                            st.markdown(f"**Organismo:** {doc['organismo'][:100]}")
+                        if doc['cuantia']:
+                            st.markdown(f"**Cuantía:** {doc['cuantia']}")
+                        if doc['plazo_solicitud']:
+                            st.markdown(f"**Plazo:** {doc['plazo_solicitud'][:100]}")
+                    
+                    with col2:
+                        st.markdown(f"**Boletín:** {doc['Boletín']}")
+                        if pd.notna(doc.get('Fecha')):
+                            st.markdown(f"**Fecha:** {doc['Fecha'].strftime('%d/%m/%Y')}")
+                        st.markdown(f"[🔗 Ver]({doc['Enlace']})")
+                    
+                    if doc['contexto_palabras']:
+                        st.markdown("---")
+                        for ctx in doc['contexto_palabras'][:2]:
+                            st.info(f"**{ctx['palabra'].upper()}:** {ctx['contexto']}")
             
-            if len(df_filtrado) > 0:
-                st.success(f"✅ **{len(df_filtrado)} resultados**")
-                
-                col1, col2, col3 = st.columns(3)
-                col1.metric("Total", len(df_filtrado))
-                col2.metric("BOJA", len(df_filtrado[df_filtrado['Boletín'] == 'BOJA']))
-                col3.metric("BOE", len(df_filtrado[df_filtrado['Boletín'] == 'BOE']))
-                
-                st.markdown("---")
-                st.subheader("📊 Resultados")
-                st.dataframe(df_filtrado, use_container_width=True, height=600)
-                
-                csv = df_filtrado.to_csv(index=False, encoding='utf-8-sig')
-                st.download_button("📥 Descargar CSV", csv, f"resultados_{datetime.now().strftime('%Y%m%d')}.csv", "text/csv")
-            else:
-                st.warning("⚠️ Sin resultados con esos filtros")
-                
-                if not contenido_completo:
-                    st.info("💡 Prueba activando 'Buscar en contenido completo' para buscar dentro de los documentos")
+            st.markdown("---")
+            csv = pd.DataFrame(docs_procesados).to_csv(index=False, encoding='utf-8-sig')
+            st.download_button("📥 Descargar CSV", csv, f"ayudas_{datetime.now().strftime('%Y%m%d_%H%M')}.csv", "text/csv")
         else:
-            st.error("❌ No se obtuvieron resultados")
+            st.warning("⚠️ Sin resultados con esos filtros")
+            if not contenido_completo:
+                st.info("💡 Activa 'Contenido completo' para buscar dentro de los documentos")
+    else:
+        st.error("❌ No se obtuvieron resultados")
 
 with st.expander("ℹ️ Ayuda"):
     st.markdown("""
-    ### ⚠️ IMPORTANTE: Búsqueda en Contenido Completo
+    ### 🎯 Nueva búsqueda exhaustiva de 3 niveles
     
-    Para que la búsqueda encuentre palabras **dentro de los documentos**:
+    **Nivel 1:** Estimación inteligente (±50 boletines)
+    **Nivel 2:** Búsqueda exhaustiva en TODO el mes
+    **Nivel 3:** Verificación fecha exacta
     
-    1. ✅ **Activa** "Buscar en contenido completo" en Opciones
-    2. Esto descargará el texto completo de cada documento
-    3. Entonces buscará tu palabra clave en TODO el contenido
-    
-    **Sin esta opción activada**, solo busca en:
-    - Títulos de documentos
-    - Resúmenes cortos
-    
-    ### Ejemplo
-    - Sin contenido completo: Encuentra 74 docs pero no la palabra "FEDER"
-    - CON contenido completo: Descarga los 74 docs y busca "FEDER" dentro de cada uno
+    Si no encuentra el boletín del 3 de marzo, probará TODOS los boletines de marzo (41-60 aproximadamente).
     """)
 
 st.markdown("---")
-st.markdown("🤖 **Versión 3.1** - Descarga de contenido mejorada con logging detallado")
-
+st.markdown("🤖 **Versión 5.0** - Búsqueda exhaustiva de 3 niveles")
