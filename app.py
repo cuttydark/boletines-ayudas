@@ -643,15 +643,32 @@ def buscar_boja_historico_exhaustivo(fecha_inicio, fecha_fin, contenido_completo
                     
                     if response.status_code == 200:
                         soup = BeautifulSoup(response.text, 'html.parser')
+                        
+                        # --- INICIO DEL CÓDIGO MODIFICADO ---
+                        
+                        # Normalizamos el texto de la página para eliminar espacios duplicados
                         texto_pagina = soup.get_text().lower()
-                        
+                        texto_pagina = re.sub(r'\s+', ' ', texto_pagina) 
+
+                        # Obtenemos el mes en texto
+                        mes_texto = ['enero','febrero','marzo','abril','mayo','junio','julio','agosto','septiembre','octubre','noviembre','diciembre'][mes-1]
+
+                        # Lista de formatos de fecha a comprobar
                         fecha_formatos = [
-                            fecha_actual.strftime('%d/%m/%Y'),
-                            fecha_actual.strftime('%d-%m-%Y'),
-                            f"{dia} de {['enero','febrero','marzo','abril','mayo','junio','julio','agosto','septiembre','octubre','noviembre','diciembre'][mes-1]} de {año}".lower()
+                            fecha_actual.strftime('%d/%m/%Y'),    # 07/03/2025
+                            fecha_actual.strftime('%d.%m.%Y'),    # 07.03.2025 (Añadido formato con puntos)
+                            fecha_actual.strftime('%d-%m-%Y'),    # 07-03-2025
+                            f" {dia} de {mes_texto} de {año} "     # " 7 de marzo de 2025 " (con espacios)
                         ]
-                        
+
                         pagina_correcta = any(fecha in texto_pagina for fecha in fecha_formatos)
+
+                        # Chequeo de rescate: si los formatos fallan, buscar solo día y mes (más flexible)
+                        if not pagina_correcta:
+                            if f" {dia} de {mes_texto} " in texto_pagina and f" {año} " in texto_pagina:
+                                pagina_correcta = True
+
+                        # --- FIN DEL CÓDIGO MODIFICADO ---
                         
                         if pagina_correcta:
                             progress_text.text(f"📅 {fecha_actual.strftime('%d/%m/%Y')} - ✅ BOJA {num_boletin}")
