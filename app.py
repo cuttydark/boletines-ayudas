@@ -644,31 +644,29 @@ def buscar_boja_historico_exhaustivo(fecha_inicio, fecha_fin, contenido_completo
                     if response.status_code == 200:
                         soup = BeautifulSoup(response.text, 'html.parser')
                         
-                        # --- INICIO DEL CÓDIGO MODIFICADO ---
-                        
-                        # Normalizamos el texto de la página para eliminar espacios duplicados
-                        texto_pagina = soup.get_text().lower()
-                        texto_pagina = re.sub(r'\s+', ' ', texto_pagina) 
+                        # --- INICIO DEL CÓDIGO CORREGIDO ---
+                        # Se añade (separator=' ', strip=True) para evitar que
+                        # "de" y "03/03/2025" se peguen como "de03/03/2025"
+                        texto_pagina = soup.get_text(separator=' ', strip=True).lower()
+                        # --- FIN DEL CÓDIGO CORREGIDO ---
 
                         # Obtenemos el mes en texto
                         mes_texto = ['enero','febrero','marzo','abril','mayo','junio','julio','agosto','septiembre','octubre','noviembre','diciembre'][mes-1]
 
-                        # Lista de formatos de fecha a comprobar
+                        # Lista de formatos de fecha a comprobar (mantenemos la versión flexible)
                         fecha_formatos = [
-                            fecha_actual.strftime('%d/%m/%Y'),    # 07/03/2025
-                            fecha_actual.strftime('%d.%m.%Y'),    # 07.03.2025 (Añadido formato con puntos)
-                            fecha_actual.strftime('%d-%m-%Y'),    # 07-03-2025
-                            f" {dia} de {mes_texto} de {año} "     # " 7 de marzo de 2025 " (con espacios)
+                            fecha_actual.strftime('%d/%m/%Y'),    # 03/03/2025
+                            fecha_actual.strftime('%d.%m.%Y'),    # 03.03.2025
+                            fecha_actual.strftime('%d-%m-%Y'),    # 03-03-2025
+                            f" {dia} de {mes_texto} de {año} "     # " 3 de marzo de 2025 "
                         ]
 
                         pagina_correcta = any(fecha in texto_pagina for fecha in fecha_formatos)
 
-                        # Chequeo de rescate: si los formatos fallan, buscar solo día y mes (más flexible)
+                        # Chequeo de rescate
                         if not pagina_correcta:
                             if f" {dia} de {mes_texto} " in texto_pagina and f" {año} " in texto_pagina:
                                 pagina_correcta = True
-
-                        # --- FIN DEL CÓDIGO MODIFICADO ---
                         
                         if pagina_correcta:
                             progress_text.text(f"📅 {fecha_actual.strftime('%d/%m/%Y')} - ✅ BOJA {num_boletin}")
