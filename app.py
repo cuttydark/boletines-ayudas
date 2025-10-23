@@ -180,13 +180,17 @@ def buscar_boja_feed(contenido_completo=False):
             if any(x in enlace for x in ['/temas/', '/organismos/']) or '/boja/' not in enlace:
                 continue
             
+            fecha = pd.to_datetime(entry.get('published', ''), errors='coerce', utc=True)
+            if pd.notna(fecha):
+                fecha = fecha.tz_localize(None)
+            
             resultados.append({
                 'Boletín': 'BOJA',
                 'Título': titulo,
                 'Resumen': BeautifulSoup(entry.get('summary', ''), 'html.parser').get_text()[:300],
                 'Contenido_Completo': extraer_contenido_completo(enlace) if contenido_completo else "",
                 'Enlace': enlace,
-                'Fecha': pd.to_datetime(entry.get('published', ''), errors='coerce', utc=True).tz_localize(None) if pd.notna(pd.to_datetime(entry.get('published', ''), errors='coerce', utc=True)) else pd.NaT
+                'Fecha': fecha
             })
     except:
         pass
@@ -199,13 +203,17 @@ def buscar_boe_rss(contenido_completo=False):
         feed = feedparser.parse(response.content)
         
         for entry in feed.entries:
+            fecha = pd.to_datetime(entry.get('published', ''), errors='coerce', utc=True)
+            if pd.notna(fecha):
+                fecha = fecha.tz_localize(None)
+            
             resultados.append({
                 'Boletín': 'BOE',
                 'Título': entry.get('title', ''),
                 'Resumen': BeautifulSoup(entry.get('summary', ''), 'html.parser').get_text()[:300],
                 'Contenido_Completo': "",
                 'Enlace': entry.get('link', ''),
-                'Fecha': pd.to_datetime(entry.get('published', ''), errors='coerce', utc=True).tz_localize(None) if pd.notna(pd.to_datetime(entry.get('published', ''), errors='coerce', utc=True)) else pd.NaT
+                'Fecha': fecha
             })
     except:
         pass
@@ -296,20 +304,23 @@ def buscar_en_boletin_completo(año, num_boletin, fecha_publicacion, contenido_c
     return resultados
 
 def encontrar_boletin_por_fecha(año, fecha_buscar, contenido_completo=False, progress_detail=None):
-    """Busca el boletín de una fecha específica probando diferentes estrategias"""
+    """Busca el boletín de una fecha específica - CORREGIDO"""
+    
+    # DEFINIR MESES AL PRINCIPIO
+    meses = ['enero','febrero','marzo','abril','mayo','junio','julio','agosto','septiembre','octubre','noviembre','diciembre']
     
     mes = fecha_buscar.month
     dia = fecha_buscar.day
     
-    # ESTRATEGIA 1: Estimación basada en días del año
+    # ESTRATEGIA 1: Estimación
     dia_año = fecha_buscar.timetuple().tm_yday
     dias_habiles = int(dia_año * (5/7))
     num_estimado = int(dias_habiles * 0.85)
     
     if progress_detail:
-        progress_detail.text(f"    🎯 Estimación inicial: BOJA {num_estimado}")
+        progress_detail.text(f"    🎯 Estimación: BOJA {num_estimado}")
     
-    # ESTRATEGIA 2: Probar rango amplio alrededor del estimado
+    # ESTRATEGIA 2: Rango amplio
     for offset in range(-50, 51):
         num_boletin = max(1, min(250, num_estimado + offset))
         
@@ -329,9 +340,6 @@ def encontrar_boletin_por_fecha(año, fecha_buscar, contenido_completo=False, pr
                     soup = BeautifulSoup(response.text, 'html.parser')
                     texto = soup.get_text().lower()
                     
-                    # Verificar fecha
-                    meses = ['enero','febrero','marzo','abril','mayo','junio','julio','agosto','septiembre','octubre','noviembre','diciembre']
-                    
                     formatos_fecha = [
                         fecha_buscar.strftime('%d/%m/%Y'),
                         f"{dia} de {meses[mes-1]} de {año}",
@@ -340,7 +348,7 @@ def encontrar_boletin_por_fecha(año, fecha_buscar, contenido_completo=False, pr
                     
                     if any(f.lower() in texto for f in formatos_fecha):
                         if progress_detail:
-                            progress_detail.text(f"    ✅ ¡ENCONTRADO! BOJA {num_boletin}")
+                            progress_detail.text(f"    ✅ ENCONTRADO! BOJA {num_boletin}")
                         
                         return buscar_en_boletin_completo(año, num_boletin, pd.to_datetime(fecha_buscar), contenido_completo, progress_detail)
                 
@@ -348,11 +356,10 @@ def encontrar_boletin_por_fecha(año, fecha_buscar, contenido_completo=False, pr
             except:
                 continue
     
-    # ESTRATEGIA 3: Si no encontró nada, probar TODOS los boletines del mes
+    # ESTRATEGIA 3: TODO el mes
     if progress_detail:
-        progress_detail.text(f"    ⚠️ No encontrado en rango. Probando TODO el mes {meses[mes-1]}...")
+        progress_detail.text(f"    ⚠️ Probando TODO el mes {meses[mes-1]}...")
     
-    # Rango de boletines para cada mes (aproximado)
     rangos_mes = {
         1: (1, 20), 2: (21, 40), 3: (41, 60), 4: (61, 80),
         5: (81, 100), 6: (101, 120), 7: (121, 140), 8: (141, 160),
@@ -363,7 +370,7 @@ def encontrar_boletin_por_fecha(año, fecha_buscar, contenido_completo=False, pr
     
     for num_boletin in range(inicio, fin + 1):
         if num_boletin % 5 == 0 and progress_detail:
-            progress_detail.text(f"    🔍 Búsqueda exhaustiva: BOJA {num_boletin}...")
+            progress_detail.text(f"    🔍 Exhaustiva: BOJA {num_boletin}...")
         
         urls = [
             f"https://www.juntadeandalucia.es/boja/{año}/{str(num_boletin).zfill(3)}/",
@@ -378,8 +385,6 @@ def encontrar_boletin_por_fecha(año, fecha_buscar, contenido_completo=False, pr
                     soup = BeautifulSoup(response.text, 'html.parser')
                     texto = soup.get_text().lower()
                     
-                    meses = ['enero','febrero','marzo','abril','mayo','junio','julio','agosto','septiembre','octubre','noviembre','diciembre']
-                    
                     formatos_fecha = [
                         fecha_buscar.strftime('%d/%m/%Y'),
                         f"{dia} de {meses[mes-1]} de {año}",
@@ -387,7 +392,7 @@ def encontrar_boletin_por_fecha(año, fecha_buscar, contenido_completo=False, pr
                     
                     if any(f.lower() in texto for f in formatos_fecha):
                         if progress_detail:
-                            progress_detail.text(f"    ✅ ¡ENCONTRADO en búsqueda exhaustiva! BOJA {num_boletin}")
+                            progress_detail.text(f"    ✅ ENCONTRADO exhaustiva! BOJA {num_boletin}")
                         
                         return buscar_en_boletin_completo(año, num_boletin, pd.to_datetime(fecha_buscar), contenido_completo, progress_detail)
                 
@@ -406,7 +411,7 @@ def buscar_boja_historico(fecha_inicio, fecha_fin, contenido_completo=False):
         st.info("🔍 Fechas recientes (feed RSS)")
         return buscar_boja_feed_filtrado_por_fechas(fecha_inicio, fecha_fin, contenido_completo)
     else:
-        st.info(f"🔍 Búsqueda exhaustiva activada ({dias_antiguedad} días)")
+        st.info(f"🔍 Búsqueda exhaustiva ({dias_antiguedad} días)")
         return buscar_boja_historico_exhaustivo(fecha_inicio, fecha_fin, contenido_completo)
 
 def buscar_boja_feed_filtrado_por_fechas(fecha_inicio, fecha_fin, contenido_completo=False):
@@ -429,7 +434,7 @@ def buscar_boja_feed_filtrado_por_fechas(fecha_inicio, fecha_fin, contenido_comp
     return resultados
 
 def buscar_boja_historico_exhaustivo(fecha_inicio, fecha_fin, contenido_completo=False):
-    """Búsqueda exhaustiva mejorada"""
+    """Búsqueda exhaustiva"""
     
     resultados = []
     fecha_actual = fecha_inicio
@@ -441,10 +446,10 @@ def buscar_boja_historico_exhaustivo(fecha_inicio, fecha_fin, contenido_completo
     total_dias = (fecha_fin - fecha_actual).days + 1
     dia_actual = 0
     
-    st.info("🔄 Búsqueda exhaustiva fecha por fecha...")
+    st.info("🔄 Búsqueda exhaustiva...")
     
     if contenido_completo:
-        st.warning("⚠️ DESCARGA DE CONTENIDO ACTIVADA")
+        st.warning("⚠️ DESCARGA ACTIVADA")
     
     while fecha_actual <= fecha_fin:
         progress_bar.progress(dia_actual / total_dias)
@@ -452,7 +457,6 @@ def buscar_boja_historico_exhaustivo(fecha_inicio, fecha_fin, contenido_completo
         
         año = fecha_actual.year
         
-        # Usar la nueva función mejorada
         docs_encontrados = encontrar_boletin_por_fecha(año, fecha_actual, contenido_completo, progress_detail)
         
         if docs_encontrados:
@@ -464,7 +468,7 @@ def buscar_boja_historico_exhaustivo(fecha_inicio, fecha_fin, contenido_completo
             else:
                 st.success(f"✅ {fecha_actual.strftime('%d/%m/%Y')}: {len(docs_encontrados)} docs")
         else:
-            st.warning(f"⚠️ {fecha_actual.strftime('%d/%m/%Y')}: No se encontró boletín para esta fecha")
+            st.warning(f"⚠️ {fecha_actual.strftime('%d/%m/%Y')}: No encontrado")
         
         fecha_actual += timedelta(days=1)
         dia_actual += 1
@@ -476,9 +480,9 @@ def buscar_boja_historico_exhaustivo(fecha_inicio, fecha_fin, contenido_completo
     
     if resultados:
         con_contenido = sum(1 for d in resultados if d.get('Tiene_Contenido', False))
-        st.success(f"✅ Búsqueda completada: {len(resultados)} documentos ({con_contenido} con contenido)")
+        st.success(f"✅ Completado: {len(resultados)} docs ({con_contenido} con contenido)")
     else:
-        st.error("❌ No se encontraron documentos en el rango de fechas especificado")
+        st.error("❌ No se encontraron documentos")
     
     return resultados
 
@@ -527,7 +531,7 @@ def filtrar_resultados(df, palabras_clave, solo_ayudas=True, busqueda_exacta=Fal
 # ============= INTERFAZ =============
 
 st.title("🔍 Buscador de Ayudas y Subvenciones")
-st.markdown("**BOJA + BOE** - Búsqueda exhaustiva mejorada")
+st.markdown("**BOJA + BOE**")
 
 with st.sidebar:
     st.header("⚙️ Config")
@@ -642,22 +646,9 @@ if st.button("🚀 Buscar", type="primary"):
             csv = pd.DataFrame(docs_procesados).to_csv(index=False, encoding='utf-8-sig')
             st.download_button("📥 Descargar CSV", csv, f"ayudas_{datetime.now().strftime('%Y%m%d_%H%M')}.csv", "text/csv")
         else:
-            st.warning("⚠️ Sin resultados con esos filtros")
-            if not contenido_completo:
-                st.info("💡 Activa 'Contenido completo' para buscar dentro de los documentos")
+            st.warning("⚠️ Sin resultados")
     else:
         st.error("❌ No se obtuvieron resultados")
 
-with st.expander("ℹ️ Ayuda"):
-    st.markdown("""
-    ### 🎯 Nueva búsqueda exhaustiva de 3 niveles
-    
-    **Nivel 1:** Estimación inteligente (±50 boletines)
-    **Nivel 2:** Búsqueda exhaustiva en TODO el mes
-    **Nivel 3:** Verificación fecha exacta
-    
-    Si no encuentra el boletín del 3 de marzo, probará TODOS los boletines de marzo (41-60 aproximadamente).
-    """)
-
 st.markdown("---")
-st.markdown("🤖 **Versión 5.0** - Búsqueda exhaustiva de 3 niveles")
+st.markdown("🤖 **Versión 5.1** - Error corregido")
