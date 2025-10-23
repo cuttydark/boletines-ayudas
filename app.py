@@ -1,23 +1,29 @@
 # -*- coding: utf-8 -*-
 import io
 import re
+import unicodedata
 import datetime as dt
 from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
 import streamlit as st
+import pandas as pd
 
-# ---------- Ajustes de página ----------
+# =========================
+# Configuración de página
+# =========================
 st.set_page_config(
-    page_title="BOJA Finder",
+    page_title="BOJA Finder (términos)",
     page_icon="📜",
     layout="wide"
 )
 
 BASE = "https://www.juntadeandalucia.es"
 
-# ---------- Utilidades HTTP con cache ----------
+# =========================
+# Utilidades HTTP (cache)
+# =========================
 @st.cache_data(show_spinner=False)
 def http_get_text(url: str, timeout=30) -> str:
     r = requests.get(url, timeout=timeout)
@@ -30,21 +36,50 @@ def http_get_bytes(url: str, timeout=60) -> bytes:
     r.raise_for_status()
     return r.content
 
-# ---------- Función DEFENSIVA para PDF ----------
+# =========================
+# Normalización texto
+# =========================
+def norm(txt: str) -> str:
+    if not txt:
+        return ""
+    # quita acentos y normaliza espacios
+    txt = unicodedata.normalize("NFKD", txt)
+    txt = "".join(ch for ch in txt if not unicodedata.combining(ch))
+    txt = " ".join(txt.split())
+    return txt.lower()
+
+# =========================
+# Extractor PDF defensivo
+# =========================
 def safe_extract_text(pdf_bytes: bytes) -> str:
     """
     Intenta extraer texto con pdfminer.six.
-    Si no está instalado o falla, devuelve cadena vacía y no rompe la app.
+    Si falla, usa PyMuPDF (si está instalado).
+    Si todo falla, devuelve "" y la app no revienta.
     """
+    # 1) pdfminer.six
     try:
         from pdfminer.high_level import extract_text
         return extract_text(io.BytesIO(pdf_bytes)) or ""
     except Exception:
-        # Aviso discreto; no paramos la app
-        st.info("No se pudo usar pdfminer.six para validar el PDF. Continuo con coincidencia en HTML.")
-        return ""
+        pass
+    # 2) PyMuPDF (fitz)
+    try:
+        import fitz  # PyMuPDF
+        with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+            chunks = []
+            for page in doc:
+                chunks.append(page.get_text("text") or "")
+        return "\n".join(chunks)
+    except Exception:
+        pass
+    # 3) Sin extractor
+    st.info("No se pudo validar el PDF (extractor no disponible). Mantengo resultados por HTML/título.")
+    return ""
 
-# ---------- Core scraping ----------
+# =========================
+# Lógica de calendario/BOJA
+# =========================
 def dias_en_rango(desde: dt.date, hasta: dt.date):
     cur = desde
     while cur <= hasta:
@@ -67,100 +102,198 @@ def url_sumario_dia(fecha: dt.date) -> str | None:
 
 @st.cache_data(show_spinner=False)
 def extraer_disposiciones(sumario_url: str):
+    """
+    Devuelve lista de dicts {titulo, url_html} para todas las disposiciones de un sumario.
+    Selectores robustos con fallback.
+    """
     html = http_get_text(sumario_url)
     soup = BeautifulSoup(html, "html.parser")
     items = []
-    # enlaces a las páginas HTML de cada disposición
-    for a in soup.select("a[href$='.html']"):
+
+    # 1) Enlaces directos a disposiciones .html
+    for a in soup.select("a[href*='/boja/'][href$='.html']"):
         href = urljoin(BASE, a.get("href"))
         titulo = a.get_text(strip=True)
-        if "/boja/" in href and href.endswith(".html"):
+        if href.endswith(".html"):
             items.append({"titulo": titulo, "url_html": href})
-    return items
+
+    # 2) Fallback por <li><a>
+    if not items:
+        for li in soup.find_all("li"):
+            a = li.find("a", href=True)
+            if not a:
+                continue
+            href = urljoin(BASE, a["href"])
+            if "/boja/" in href and href.endswith(".html"):
+                titulo = a.get_text(strip=True) or li.get_text(" ", strip=True)[:140]
+                items.append({"titulo": titulo, "url_html": href})
+
+    # 3) Dedup
+    seen = set()
+    dedup = []
+    for it in items:
+        if it["url_html"] in seen:
+            continue
+        seen.add(it["url_html"])
+        dedup.append(it)
+    return dedup
 
 @st.cache_data(show_spinner=False)
 def url_pdf_disposicion(url_html: str) -> str | None:
     html = http_get_text(url_html)
     soup = BeautifulSoup(html, "html.parser")
-    # enlace que contenga "Descargar PDF"
     link = soup.find("a", string=re.compile(r"Descargar PDF", re.I))
     return urljoin(BASE, link["href"]) if link and link.has_attr("href") else None
 
-def buscar(desde: dt.date, hasta: dt.date, patron: str, validar_pdf: bool):
-    rx = re.compile(patron, re.I)
+# =========================
+# Búsqueda por términos
+# =========================
+def parse_terms(entrada: str) -> list[str]:
+    """
+    Admite términos separados por coma o por salto de línea.
+    Ignora vacíos.
+    """
+    if not entrada:
+        return []
+    raw = [t.strip() for t in re.split(r"[,\n]+", entrada)]
+    return [t for t in raw if t]
+
+def match_terms(texto_norm: str, terms_norm: list[str], modo: str) -> bool:
+    """
+    modo: "all" -> deben aparecer todos los términos
+          "any" -> basta con que aparezca alguno
+    """
+    if not terms_norm:
+        return False
+    hits = [t in texto_norm for t in terms_norm]
+    return all(hits) if modo == "all" else any(hits)
+
+def buscar(desde: dt.date,
+           hasta: dt.date,
+           terms: list[str],
+           modo_terminos: str,
+           buscar_en_titulo: bool,
+           validar_pdf: bool,
+           debug: bool):
+    """
+    Devuelve lista de resultados:
+    {fecha, titulo, url_html, url_pdf (opcional), fuente_match ('titulo'/'html'/'pdf')}
+    """
+    terms_norm = [norm(t) for t in terms]
     hallazgos = []
 
     for dia in dias_en_rango(desde, hasta):
+        if debug:
+            st.write(f"🔎 Día: {dia.isoformat()}")
+
+        # 1) Localiza sumario
         try:
             sumario = url_sumario_dia(dia)
         except Exception as e:
-            st.warning(f"No pude cargar el calendario de {dia.year} ({e}). Sigo con el siguiente día.")
+            if debug:
+                st.error(f"❌ Calendario {dia.year}: {e}")
             continue
 
         if not sumario:
-            # Días sin BOJA publicado
+            if debug:
+                st.warning(f"⚠️ Sin sumario para {dia} (posible día sin BOJA)")
             continue
 
+        # 2) Extrae disposiciones
         try:
             dispos = extraer_disposiciones(sumario)
+            if debug:
+                st.write(f"📄 Sumario {dia}: {len(dispos)} disposiciones")
+            if debug and dispos:
+                st.caption(f"Ejemplo: {dispos[0]['url_html']}")
         except Exception as e:
-            st.warning(f"No pude leer el sumario de {dia.isoformat()} ({e}).")
+            if debug:
+                st.error(f"❌ Sumario {dia}: {e}")
             continue
 
+        # 3) Evalúa cada disposición
         for disp in dispos:
-            try:
-                html_texto = BeautifulSoup(http_get_text(disp["url_html"]), "html.parser").get_text(" ", strip=True)
-            except Exception as e:
-                st.warning(f"No pude abrir la disposición: {disp['url_html']} ({e}).")
-                continue
+            titulo_norm = norm(disp["titulo"])
+            fuente_match = None
 
-            if not rx.search(html_texto):
-                continue
+            # 3.1) Título
+            if buscar_en_titulo and match_terms(titulo_norm, terms_norm, modo_terminos):
+                fuente_match = "titulo"
 
+            # 3.2) HTML
+            if not fuente_match:
+                try:
+                    html_texto = BeautifulSoup(http_get_text(disp["url_html"]), "html.parser").get_text(" ", strip=True)
+                    html_norm = norm(html_texto)
+                    if match_terms(html_norm, terms_norm, modo_terminos):
+                        fuente_match = "html"
+                except Exception as e:
+                    if debug:
+                        st.warning(f"⚠️ No se pudo leer HTML de {disp['url_html']} ({e})")
+
+            # 3.3) PDF (validación opcional)
             pdf_url = None
-            if validar_pdf:
+            if fuente_match and validar_pdf:
                 try:
                     pdf_url = url_pdf_disposicion(disp["url_html"])
                     if pdf_url:
-                        texto_pdf = safe_extract_text(http_get_bytes(pdf_url))
-                        if not texto_pdf or not rx.search(texto_pdf):
-                            # Si no valida en PDF, descarta
-                            continue
+                        pdf_norm = norm(safe_extract_text(http_get_bytes(pdf_url)))
+                        # Si no valida en PDF, mantenemos el match por título/HTML (no descartamos)
+                        if match_terms(pdf_norm, terms_norm, modo_terminos):
+                            fuente_match = "pdf"
+                except Exception as e:
+                    if debug:
+                        st.info(f"ℹ️ No se pudo validar PDF ({e}). Se mantiene el match por {fuente_match}.")
+            else:
+                # si no validamos PDF, al menos intentamos obtener la URL por comodidad
+                try:
+                    pdf_url = url_pdf_disposicion(disp["url_html"])
                 except Exception:
-                    # Si falla la validación PDF, no tumbamos la app; dejamos pasar por HTML
-                    pass
+                    pdf_url = None
 
-            hallazgos.append({
-                "fecha": dia.isoformat(),
-                "titulo": disp["titulo"],
-                "url_html": disp["url_html"],
-                "url_pdf": pdf_url
-            })
+            if fuente_match:
+                hallazgos.append({
+                    "fecha": dia.isoformat(),
+                    "titulo": disp["titulo"],
+                    "url_html": disp["url_html"],
+                    "url_pdf": pdf_url,
+                    "coincidencia": fuente_match
+                })
 
     return hallazgos
 
-# ---------- UI ----------
-st.title("📜 BOJA Finder")
-st.caption("Busca un patrón (regex o texto literal) en disposiciones del BOJA entre dos fechas. Opción de validar contra el PDF oficial.")
+# =========================
+# UI
+# =========================
+st.title("📜 BOJA Finder — Búsqueda por términos (sin regex)")
+st.caption("Busca uno o varios términos (separados por coma o salto de línea) en el BOJA entre dos fechas. Acentos insensibles. Opción de validar contra el PDF oficial.")
 
 with st.sidebar:
     st.header("Parámetros")
     colA, colB = st.columns(2)
     desde = colA.date_input("Desde", value=dt.date(2025, 3, 3))
     hasta = colB.date_input("Hasta", value=dt.date(2025, 3, 16))
-    patron_default = r"\bvivienda\b"
-    patron = st.text_input("Patrón de búsqueda (regex)", value=patron_default, help="Usa regex de Python. Ej: \\bvivienda\\b")
-    validar_pdf = st.checkbox("Validar coincidencia en PDF oficial", value=True)
-    demo = st.toggle("Ejemplo rápido (ignora parámetros)", value=False, help="Usa un rango pequeño conocido para comprobar la app.")
-    st.divider()
-    with st.popover("Ayuda rápida"):
-        st.markdown(
-            "- **Patrón** admite regex. Para texto literal, escribe la palabra tal cual.\n"
-            "- Si no ves resultados, prueba desmarcar **Validar PDF**.\n"
-            "- Los días sin BOJA no devuelven resultados."
-        )
 
-# Formulario para ejecutar bajo demanda (evita reruns en cada cambio)
+    terms_input = st.text_area(
+        "Términos de búsqueda",
+        value="vivienda",
+        help="Separa por coma o por salto de línea. Ej.: vivienda, ayudas, alquiler"
+    )
+    terms = parse_terms(terms_input)
+
+    modo_terminos = st.radio(
+        "Coincidencia de términos",
+        options=[("Todos", "all"), ("Cualquiera", "any")],
+        format_func=lambda x: x[0],
+        horizontal=True
+    )[1]
+
+    buscar_en_titulo = st.checkbox("Buscar también en el título", value=True)
+    validar_pdf = st.checkbox("Validar coincidencia en PDF oficial", value=False)
+    debug = st.toggle("Modo diagnóstico", value=True)
+    demo = st.toggle("Ejemplo rápido", value=False, help="Ignora parámetros y prueba 2025-03-03 a 2025-03-05 con 'vivienda'.")
+
+# Form para ejecutar bajo demanda
 with st.form("buscar_form"):
     lanzador = st.form_submit_button("🔎 Buscar", use_container_width=True)
 
@@ -168,41 +301,43 @@ if lanzador:
     if demo:
         desde = dt.date(2025, 3, 3)
         hasta = dt.date(2025, 3, 5)
-        patron = r"\bvivienda\b"
+        terms = ["vivienda"]
+        modo_terminos = "any"
+        buscar_en_titulo = True
+        validar_pdf = False
+        debug = True
 
-    # Validaciones básicas
+    # Validaciones
     if hasta < desde:
         st.error("El rango de fechas es inválido: 'Hasta' es anterior a 'Desde'.")
     elif (hasta - desde).days > 31:
         st.warning("Rango grande. Para ir rápido, prueba ≤ 31 días. Aún así, continúo…")
         with st.spinner("Buscando (rango amplio)…"):
-            resultados = buscar(desde, hasta, patron, validar_pdf)
+            resultados = buscar(desde, hasta, terms, modo_terminos, buscar_en_titulo, validar_pdf, debug)
         st.success(f"Coincidencias: {len(resultados)}")
     else:
         with st.spinner("Buscando…"):
-            resultados = buscar(desde, hasta, patron, validar_pdf)
+            resultados = buscar(desde, hasta, terms, modo_terminos, buscar_en_titulo, validar_pdf, debug)
         st.success(f"Coincidencias: {len(resultados)}")
 
+    # Resultados
     if resultados:
-        # Tabla
-        import pandas as pd
+        # Tabla compacta con enlaces
+        def elink(url): return f"[abrir]({url})" if url else ""
         df = pd.DataFrame(resultados)
-        # Enlaces clicables
-        def elink(url):
-            return f"[abrir]({url})" if url else ""
         df_view = df.copy()
         df_view["HTML"] = df_view["url_html"].map(elink)
         df_view["PDF"] = df_view["url_pdf"].map(elink)
-        df_view = df_view.drop(columns=["url_html", "url_pdf"])
+        df_view = df_view[["fecha", "titulo", "coincidencia", "HTML", "PDF"]]
         st.dataframe(df_view, use_container_width=True, hide_index=True)
 
-        # Listado
+        # Listado expandido
         st.divider()
         for r in resultados:
             st.markdown(f"**{r['fecha']} — {r['titulo']}**")
             links = f"[HTML]({r['url_html']})"
             if r["url_pdf"]:
                 links += f" · [PDF]({r['url_pdf']})"
-            st.write(links)
+            st.write(f"{links}  ·  Coincidencia: **{r['coincidencia']}**")
     else:
         st.info("Sin coincidencias para los parámetros indicados.")
